@@ -1,0 +1,6 @@
+# Mevcut Python .gitignore içeriği burada olacak...
+
+# Bizim eklediklerimiz
+*.parquet
+*.csv
+data/
