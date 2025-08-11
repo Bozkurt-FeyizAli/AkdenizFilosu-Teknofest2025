@@ -1,7 +1,6 @@
-# utils/helpers.py
-
 import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score # Bu importu ekleyin
 
 def safe_div(a, b):
     """Sıfıra bölme hatasını önleyen güvenli bölme işlemi."""
@@ -9,7 +8,14 @@ def safe_div(a, b):
     b = b.astype(float)
     out = np.zeros_like(a, dtype=float)
     mask = b > 0
-    out[mask] = a[mask] / b[mask]
+    # Pandas serileri için .values kullanarak numpy dizisine erişim sağlayalım
+    a_vals = a.values if isinstance(a, pd.Series) else a
+    b_vals = b.values if isinstance(b, pd.Series) else b
+    mask_vals = b_vals > 0
+    out[mask_vals] = a_vals[mask_vals] / b_vals[mask_vals]
+    
+    if isinstance(a, pd.Series):
+        return pd.Series(out, index=a.index)
     return out
 
 def season_from_month(m):
@@ -51,3 +57,26 @@ def chunked_merge(left_df, right_df, on_cols, how="left", chunk_size=500_000):
         chunk = left_df.iloc[start:start + chunk_size]
         parts.append(chunk.merge(right_df, on=on_cols, how=how))
     return pd.concat(parts, ignore_index=True)
+
+
+# ## YENİ EKLENEN FONKSİYON ##
+def session_auc(df_with_targets, scores, target_col):
+    """
+    Oturum bazında (session-wise) AUC skorunu hesaplar.
+    """
+    # Fonksiyonun Pandas DataFrame'leri ile çalıştığından emin olalım
+    if not isinstance(df_with_targets, pd.DataFrame):
+        df_with_targets = df_with_targets.to_pandas()
+
+    tmp = df_with_targets.copy()
+    tmp["__score__"] = scores
+    
+    # Oturumda en az bir pozitif ve bir negatif örnek varsa AUC hesapla
+    aucs = [
+        roc_auc_score(g[target_col], g["__score__"])
+        for _, g in tmp.groupby("session_id")
+        if g[target_col].nunique() > 1
+    ]
+    
+    # Eğer hiçbir oturum AUC hesaplamaya uygun değilse NaN dön, aksi halde ortalamayı al
+    return float(np.mean(aucs)) if aucs else float("nan")
