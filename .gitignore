@@ -3,4 +3,7 @@
 # Bizim eklediklerimiz
 *.parquet
 *.csv
+*.pyc
+.gitignore
+trendyol-e-ticaret-hackathonu-2025-kaggle
 data/

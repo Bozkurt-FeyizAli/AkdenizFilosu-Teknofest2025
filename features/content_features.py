@@ -1,5 +1,3 @@
-# features/content_features.py
-
 import pandas as pd
 from pathlib import Path
 from utils.helpers import latest_by_key_fast, safe_div
@@ -19,9 +17,10 @@ def generate_content_features(data_path: Path) -> pd.DataFrame:
     print("    [Content] Meta, fiyat ve log verileri okunuyor...")
     meta = pd.read_parquet(
         data_path / "content" / "metadata.parquet",
+        # ## DEĞİŞİKLİK: 'cv_tags' sütunu eklendi ##
         columns=["content_id_hashed", "level1_category_name", "level2_category_name", "leaf_category_name",
                  "attribute_type_count", "total_attribute_option_count", "merchant_count", "filterable_label_count",
-                 "content_creation_date"],
+                 "content_creation_date", "cv_tags"], 
     )
     price = pd.read_parquet(
         data_path / "content" / "price_rate_review_data.parquet",
@@ -63,6 +62,10 @@ def generate_content_features(data_path: Path) -> pd.DataFrame:
     final_content_df = (meta.merge(content_price, on="content_id_hashed", how="left")
                             .merge(content_search, on="content_id_hashed", how="left")
                             .merge(content_site, on="content_id_hashed", how="left"))
+    
+    # ## YENİ EKLENEN KISIM: cv_tags temizliği ##
+    # Boş 'cv_tags' değerlerini boş string ile dolduralım ki sonraki adımlarda hata vermesin.
+    final_content_df['cv_tags'] = final_content_df['cv_tags'].fillna('')
 
     print("    [Content] Özellik üretimi tamamlandı.")
     return final_content_df
