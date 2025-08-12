@@ -68,8 +68,8 @@ def run_optimization(trial, target_col, tr, va, feat_cols):
 # =================================================================
 def main(args):
     DATA = Path(args.data_dir)
-    N_SPLITS = 10  # Çapraz validasyon için katman sayısı
-    N_TRIALS = 100 # Her model için Optuna deneme sayısı
+    N_SPLITS = 5  # Çapraz validasyon için katman sayısı
+    N_TRIALS = 45 # Her model için Optuna deneme sayısı
 
     # ADIM 1: ÖZELLİK ÜRETİMİ
     train_feature_path = DATA / "train_features.parquet"
