@@ -167,7 +167,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kapsamlı LTR Pipeline (LGBMRanker + Optuna + v4 Features)")
-    parser.add_argument("--data_dir", type=str, default="./", help="Veri klasörü.")
+    parser.add_argument("--data_dir", type=str, default="data", help="Veri klasörü.")
     parser.add_argument("--out", type=str, default="submission_ranker_v4.csv", help="Gönderim dosyası adı.")
     parser.add_argument("--force_rebuild", action="store_true", help="v4 özellikleri yeniden oluşturur.")
     parser.add_argument("--n_trials", type=int, default=30, help="Her katman için Optuna deneme sayısı.")

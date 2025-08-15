@@ -120,9 +120,9 @@ def generate_features(data_dir: Path, is_train: bool):
         # Sadece eğitim setinde target değişkenleri vardır. Bunları sızıntısız geçmiş oluşturmak için kullanacağız.
         history_cols = ["clicked", "ordered"]
         main_df_lazy = main_df_lazy.with_columns(
-            (pl.col(c).cumsum().over(["user_id_hashed", "content_id_hashed"]) - pl.col(c)).alias(f"hist_user_content_{c}") for c in history_cols
+            (pl.col(c).cum_sum().over(["user_id_hashed", "content_id_hashed"]) - pl.col(c)).alias(f"hist_user_content_{c}") for c in history_cols
         ).with_columns(
-            (pl.col(c).cumsum().over(["user_id_hashed", "leaf_category_name"]) - pl.col(c)).alias(f"hist_user_cat_{c}") for c in history_cols
+            (pl.col(c).cum_sum().over(["user_id_hashed", "leaf_category_name"]) - pl.col(c)).alias(f"hist_user_cat_{c}") for c in history_cols
         )
     
     final_lazy = main_df_lazy.with_columns(
