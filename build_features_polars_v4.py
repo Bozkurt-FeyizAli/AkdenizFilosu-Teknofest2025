@@ -124,16 +124,13 @@ def generate_features(data_dir: Path, is_train: bool):
         ).with_columns(
             (pl.col(c).cum_sum().over(["user_id_hashed", "leaf_category_name"]) - pl.col(c)).alias(f"hist_user_cat_{c}") for c in history_cols
         )
-    
     final_lazy = main_df_lazy.with_columns(
-        # Oturum içi (session-context) sıralama ve z-skor özellikleri
-        session_price_rank = pl.col("discounted_price").rank().over("session_id"),
-        session_pop_rank = pl.col("c_click_sum").rank().over("session_id"),
-        
-        session_price_z = (pl.col("discounted_price") - pl.col("discounted_price").mean().over("session_id")) / (pl.col("discounted_price").std().over("session_id") + 1e-6),
-        session_pop_z = (pl.col("c_click_sum") - pl.col("c_click_sum").mean().over("session_id")) / (pl.col("c_click_sum").std().over("session_id") + 1e-6)
-    ).sort("ts_hour") # Geçmiş özelliklerini doğru hesaplamak için sıralama önemli
-    
+    # Oturum içi (session-context) sıralama ve z-skor özellikleri
+    session_price_rank = pl.col("discounted_price").rank().over("session_id"),
+    session_pop_rank = pl.col("c_click_sum").rank().over("session_id"),
+    session_price_z = (pl.col("discounted_price") - pl.col("discounted_price").mean().over("session_id")) / (pl.col("discounted_price").std().over("session_id") + 1e-6),
+    session_pop_z = (pl.col("c_click_sum") - pl.col("c_click_sum").mean().over("session_id")) / (pl.col("c_click_sum").std().over("session_id") + 1e-6)
+    )
     # ---------------------------------
     # 5. Planı Çalıştır ve Kaydet
     # ---------------------------------

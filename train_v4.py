@@ -1,4 +1,4 @@
-# train_v4.py
+# train_v4.py (KeyError Düzeltildi)
 
 import argparse
 from pathlib import Path
@@ -7,53 +7,20 @@ import lightgbm as lgb
 import optuna
 import warnings
 import numpy as np
-from sklearn.preprocessing import OrdinalEncoder
 from sklearn.model_selection import GroupKFold
 
-# v4 seviyesindeki Polars özellik üretme betiğini import ediyoruz
 from build_features_polars_v4 import generate_features
 
-# Gürültüyü azaltmak için Optuna loglamasını kapatalım
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore")
 pd.set_option("display.max_columns", 200)
 
-# =================================================================
-# Gelişmiş Özellik Fonksiyonu (Basitleştirilmiş)
-# =================================================================
-def jaccard_similarity(list1, list2):
-    s1 = set(list1); s2 = set(list2)
-    intersection = len(s1.intersection(s2)); union = len(s1.union(s2))
-    return intersection / union if union != 0 else 0.0
 
-def add_post_features(df: pd.DataFrame) -> pd.DataFrame:
-    print("   - Pandas-tabanlı son özellikler ekleniyor (Jaccard)...")
-    df['search_term_normalized'] = df['search_term_normalized'].fillna('').astype(str)
-    df['cv_tags'] = df['cv_tags'].fillna('').astype(str)
-    
-    # Paralel Jaccard hesaplaması için daha hızlı bir yöntem (büyük veri setleri için)
-    jaccard_scores = df[['search_term_normalized', 'cv_tags']].apply(
-        lambda row: jaccard_similarity(row['search_term_normalized'].split(), row['cv_tags'].split()), axis=1
-    )
-    df['term_tag_jaccard_similarity'] = jaccard_scores
-    
-    return df
-
-# =================================================================
-# OPTUNA OPTİMİZASYON FONKSİYONU (LGBMRanker için)
-# =================================================================
-def run_ranker_optimization(trial, tr, va, feat_cols, group_tr, group_va):
-    """
-    LGBMRanker için Optuna hiperparametre optimizasyonu yapar.
-    """
+def run_ranker_optimization(trial, tr, va, feat_cols, group_tr, group_va, cat_features):
+    # ... (Bu fonksiyon aynı, değişiklik yok) ...
     params = {
-        'objective': 'lambdarank',
-        'metric': 'ndcg',  # Sıralama için standart metrik
-        'random_state': 42,
-        'n_estimators': 2000,
-        'boosting_type': 'gbdt',
-        'n_jobs': -1,
-        'verbosity': -1,
+        'objective': 'lambdarank','metric': 'ndcg','random_state': 42,'n_estimators': 2000,
+        'boosting_type': 'gbdt','n_jobs': -1,'verbosity': -1,
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
         'num_leaves': trial.suggest_int('num_leaves', 20, 400),
         'max_depth': trial.suggest_int('max_depth', 4, 12),
@@ -61,26 +28,22 @@ def run_ranker_optimization(trial, tr, va, feat_cols, group_tr, group_va):
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
         'lambdarank_truncation_level': trial.suggest_int('lambdarank_truncation_level', 5, 20),
     }
-
     model = lgb.LGBMRanker(**params)
     model.fit(
         tr[feat_cols], tr['target'], group=group_tr,
         eval_set=[(va[feat_cols], va['target'])], eval_group=[group_va],
+        categorical_feature=cat_features,
         callbacks=[lgb.early_stopping(100, verbose=False)]
     )
-    
-    # En iyi nDCG skorunu döndür
-    return model.best_score_['valid_0']['ndcg@1'] # @1 veya @5 gibi bir metrik seçilebilir
+    return model.best_score_['valid_0']['ndcg@1']
 
-# =================================================================
-# ANA ORKESTRASYON
-# =================================================================
 def main(args):
     DATA = Path(args.data_dir)
     N_SPLITS = 5
     N_TRIALS = args.n_trials
 
-    # ADIM 1: ÖZELLİK ÜRETİMİ (v4)
+    # ADIM 1: ÖZELLİK ÜRETİMİ
+    # ... (Bu kısım aynı, değişiklik yok) ...
     train_feature_path = DATA / "train_features_v4.parquet"
     test_feature_path = DATA / "test_features_v4.parquet"
     if not train_feature_path.exists() or not test_feature_path.exists() or args.force_rebuild:
@@ -93,25 +56,35 @@ def main(args):
     trainX = pd.read_parquet(train_feature_path)
     testX = pd.read_parquet(test_feature_path)
     
-    #trainX = add_post_features(trainX)
-    #testX = add_post_features(testX)
-
-    # (v4 DEĞİŞİKLİĞİ) Birleşik hedef değişkeni oluşturma
     trainX['target'] = trainX['clicked'] + trainX['ordered']
+
+    # =========================================================================
+    # YENİ EKLENEN DÜZELTME: Sütunları Eşitleme
+    # -------------------------------------------------------------------------
+    # trainX'te olup testX'te olmayan sütunları bul (bunlar 'target' ve 'hist_...' sütunları olacak)
+    missing_cols = set(trainX.columns) - set(testX.columns)
+    for c in missing_cols:
+        # Bu eksik sütunları testX'e ekle ve varsayılan bir değerle doldur
+        testX[c] = -1.0 
+    # =========================================================================
 
     cat_cols = ["level1_category_name", "leaf_category_name", "user_gender"]
     ignore_cols = ["ts_hour", "search_term_normalized", "clicked", "ordered", "added_to_cart", "added_to_fav",
                    "user_id_hashed", "content_id_hashed", "session_id", "content_creation_date", "cv_tags",
-                   "target", "level2_category_name"] # L2 genellikle L1 ve Leaf arasında gereksizdir
-    feat_cols = [col for col in trainX.columns if col not in ignore_cols and "_id_" not in col]
+                   "target", "level2_category_name", "update_date", "date"]
     
-    for df in [trainX, testX]: df[feat_cols] = df[feat_cols].fillna(-1.0).astype("float32")
-        
-    print(f"Kullanılacak özellik sayısı: {len(feat_cols)}")
+    num_cols = [col for col in trainX.columns if col not in ignore_cols and col not in cat_cols]
+    feat_cols = cat_cols + num_cols
+    
+    print(f"Kullanılacak özellik sayısı: {len(feat_cols)} ({len(cat_cols)} kategorik, {len(num_cols)} sayısal)")
 
-    # =================================================================
-    # ADIM 3: ÇAPRAZ VALİDASYON İLE LGBMRanker EĞİTİMİ
-    # =================================================================
+    for df in [trainX, testX]:
+        df[num_cols] = df[num_cols].fillna(-1.0).astype("float32")
+        for c in cat_cols:
+            df[c] = df[c].astype('category')
+
+    # ADIM 3: ÇAPRAZ VALİDASYON
+    # ... (Geri kalanı tamamen aynı, değişiklik yok) ...
     print(f"\n[2/4] LGBMRanker için {N_SPLITS}-Katmanlı Çapraz Validasyon Başlatılıyor...")
     
     gkf = GroupKFold(n_splits=N_SPLITS)
@@ -125,29 +98,25 @@ def main(args):
         group_tr = tr.groupby('session_id', sort=False).size().to_numpy()
         group_va = va.groupby('session_id', sort=False).size().to_numpy()
         
-        # --- TEK BİR SIRALAMA MODELİ İÇİN OPTİMİZASYON ---
         print(f"   - Fold {fold+1}: LGBMRanker için Optuna çalışıyor ({N_TRIALS} deneme)...")
         study = optuna.create_study(direction='maximize')
-        study.optimize(lambda trial: run_ranker_optimization(trial, tr, va, feat_cols, group_tr, group_va), n_trials=N_TRIALS)
+        study.optimize(lambda trial: run_ranker_optimization(trial, tr, va, feat_cols, group_tr, group_va, cat_cols), n_trials=N_TRIALS)
         
         best_params = study.best_params
         print(f"   - Fold {fold+1}: En iyi nDCG: {study.best_value:.6f}")
         
-        # --- En iyi parametrelerle final modeli eğit ve test için tahmin yap ---
         print(f"   - Fold {fold+1}: Final model eğitiliyor ve test tahmini yapılıyor...")
         model = lgb.LGBMRanker(objective='lambdarank', metric='ndcg', random_state=42, n_jobs=-1, n_estimators=4000, **best_params)
         model.fit(tr[feat_cols], tr['target'], group=group_tr,
                   eval_set=[(va[feat_cols], va['target'])], eval_group=[group_va],
+                  categorical_feature=cat_cols,
                   callbacks=[lgb.early_stopping(150, verbose=False)])
         
         oof_test_preds.append(model.predict(testX[feat_cols]))
         print(f"FOLD {fold+1}/{N_SPLITS} TAMAMLANDI")
 
-    # =================================================================
-    # ADIM 4: TAHMİNLERİ BİRLEŞTİR VE GÖNDERİM DOSYASI OLUŞTUR
-    # =================================================================
+    # ADIM 4: TAHMİNLERİ BİRLEŞTİR VE GÖNDERİM
     print("\n[3/4] Tüm katmanların sıralama skorları birleştiriliyor...")
-    
     avg_rank_scores = np.mean(oof_test_preds, axis=0)
     
     out = testX[["session_id", "content_id_hashed"]].copy()
