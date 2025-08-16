@@ -1,6 +1,6 @@
 from pathlib import Path
 import pandas as pd, numpy as np
-from ..helpers import duck, safe_div, reduce_mem_usage
+from ..helpers_v6 import duck, safe_div, reduce_mem_usage
 
 # ---------- CONTENT side aggregates ----------
 def _content_latest_price_rate(data_dir: Path):
