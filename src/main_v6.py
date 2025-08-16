@@ -1,22 +1,39 @@
 # -*- coding: utf-8 -*-
-import argparse, numpy as np, pandas as pd, lightgbm as lgb, xgboost as xgb
+import argparse
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import xgboost as xgb
 from pathlib import Path
 
-from helpers_v6 import (
+# ÖNEMLİ: Paket yolu net olsun diye 'src.' ile import ediyoruz
+from src.helpers_v6 import (
     reduce_cats, reduce_mem_usage, safe_div,
-    tfidf_cosine_sparse, aggregate_with_decay, covisitation_pairs,
-    add_price_review_features,            # ← YENİ
-    add_user_term_category_features,      # ← YENİ
-    add_time_patterns,                   # ← YENİ
-    reduce_cats, reduce_mem_usage,
-    safe_div,
-    tfidf_cosine_sparse,           # TF-IDF(q, cv_tags) cosine
-    aggregate_with_decay,          # λ-decay agregat
-    covisitation_pairs, 
+    aggregate_with_decay, covisitation_pairs,
+    add_price_review_features,
+    add_user_term_category_features,
+    add_time_patterns,
 )
+from src.metric_wrappers_v6 import trendyol_final
 
+# ---- Yerel, güvenli TF-IDF cosine (helpers_v6 içindekini override ediyoruz) ----
+from sklearn.feature_extraction.text import TfidfVectorizer
+def _tfidf_cosine_sparse_local(a_texts, b_texts, max_features=50_000, ngram_range=(1,2)):
+    a = pd.Series(a_texts).fillna('').astype(str)
+    b = pd.Series(b_texts).fillna('').astype(str)
 
-from metric_wrappers_v6 import trendyol_final
+    # Ortak vocabulary için birleşik korpusla fit
+    vec = TfidfVectorizer(max_features=max_features, ngram_range=ngram_range)
+    vec.fit(pd.concat([a, b], ignore_index=True).tolist())
+
+    Xa = vec.transform(a.tolist())
+    Xb = vec.transform(b.tolist())
+
+    # satır bazlı cosine: (Xa·Xb) / (||Xa|| * ||Xb||)
+    numer = (Xa.multiply(Xb)).sum(axis=1).A1
+    norm_a = np.sqrt(Xa.multiply(Xa).sum(axis=1)).A1
+    norm_b = np.sqrt(Xb.multiply(Xb).sum(axis=1)).A1
+    return numer / (norm_a * norm_b + 1e-9)
 
 
 # -------------------------- time-aware folds --------------------------
@@ -38,7 +55,7 @@ def add_tfidf_similarity(df, data_dir):
     meta = pd.read_parquet(Path(data_dir) / "content/metadata.parquet",
                            columns=["content_id_hashed","cv_tags"])
     tmp = df.merge(meta, on="content_id_hashed", how="left")
-    sim = tfidf_cosine_sparse(
+    sim = _tfidf_cosine_sparse_local(
         tmp["search_term_normalized"].astype(str),
         tmp["cv_tags"].astype(str),
         max_features=50_000
@@ -48,7 +65,7 @@ def add_tfidf_similarity(df, data_dir):
 
 def add_decay_aggregates(df, data_dir):
     """ λ-decay ile içerik / terim / kullanıcı agregatları """
-    # content/sitewide_log: decay total_click, total_order → join by content_id
+    # content/sitewide_log
     c_site = pd.read_parquet(Path(data_dir)/"content/sitewide_log.parquet",
                              columns=["date","content_id_hashed","total_click","total_order"])
     c_site["date"] = pd.to_datetime(c_site["date"])
@@ -61,7 +78,7 @@ def add_decay_aggregates(df, data_dir):
     agg_c = agg_click.merge(agg_order, on="content_id_hashed", how="outer").fillna(0)
     df = df.merge(agg_c, on="content_id_hashed", how="left")
 
-    # term/search_log: decay impression/click → CTR
+    # term/search_log → CTR
     tlog = pd.read_parquet(Path(data_dir)/"term/search_log.parquet",
                            columns=["ts_hour","search_term_normalized",
                                     "total_search_impression","total_search_click"])
@@ -73,15 +90,14 @@ def add_decay_aggregates(df, data_dir):
                                 ["search_term_normalized"], "total_search_click", "ts",
                                 half_life=10*24*3600)
     dt = dimp.merge(dclk, on="search_term_normalized", how="outer").fillna(0)
-    df["term_ctr_decay"] = 0.0
     df = df.merge(
-        dt.assign(term_ctr_decay=safe_div(dt["total_search_click_decay"],
-                                          dt["total_search_impression_decay"]))[
+        dt.assign(term_ctr_decay=safe_div(dt.get("total_search_click_decay", 0),
+                                          dt.get("total_search_impression_decay", 0)))[
             ["search_term_normalized","term_ctr_decay"]],
         on="search_term_normalized", how="left"
     )
 
-    # user/sitewide_log: decay order/click as user recency preference
+    # user/sitewide_log
     u_site = pd.read_parquet(Path(data_dir)/"user/sitewide_log.parquet",
                              columns=["ts_hour","user_id_hashed","total_click","total_order"])
     u_site["ts_hour"] = pd.to_datetime(u_site["ts_hour"])
@@ -99,7 +115,6 @@ def add_cross_counts(df_train_sessions, tr, te):
     """ User×Category ve User×Term sayımları (train geçmişinden) """
     tdf = df_train_sessions[["user_id_hashed","search_term_normalized",
                              "content_id_hashed","ts_hour"]].copy()
-    # leaf_category_name’ı tr’den çek
     catmap = tr[["content_id_hashed","leaf_category_name"]].drop_duplicates()
     tdf = tdf.merge(catmap, on="content_id_hashed", how="left")
 
@@ -115,7 +130,7 @@ def add_cross_counts(df_train_sessions, tr, te):
     return tr, te
 
 def add_covis_score(tr, te, data_dir):
-    """ Basit co-visitation skoru: item-item pair sayımlarından normalize skor """
+    """ Basit co-visitation skoru """
     ufl = pd.read_parquet(Path(data_dir)/"user/fashion_sitewide_log.parquet",
                           columns=["ts_hour","user_id_hashed","content_id_hashed","total_click"])
     ufl = ufl.dropna(subset=["user_id_hashed","content_id_hashed"])
@@ -139,7 +154,8 @@ def add_covis_score(tr, te, data_dir):
 
 
 # -------------------------- Trainers & Ensembling --------------------------
-NUM_BOOST=4000; ES=200
+NUM_BOOST = 4000
+ES = 200
 
 def _lgb_train(dtr, dva, params, rounds=NUM_BOOST, es=ES):
     return lgb.train(
@@ -156,7 +172,7 @@ def train_ranker_lgb(df, feats, label):
     )
     oof = np.zeros(len(df)); models=[]
     for tr_idx, va_idx in _time_group_folds(df, n_splits=5):
-        tr, va = df.iloc[tr_idx], df.iloc[va_idx]
+        tr = df.iloc[tr_idx]; va = df.iloc[va_idx]
         gtr = tr.groupby("session_id", observed=True).size().values
         gva = va.groupby("session_id", observed=True).size().values
         dtr = lgb.Dataset(tr[feats], label=tr[label], group=gtr, free_raw_data=False)
@@ -169,7 +185,7 @@ def train_ranker_lgb(df, feats, label):
 def train_ranker_xgb(df, feats, label):
     oof = np.zeros(len(df)); models=[]
     for tr_idx, va_idx in _time_group_folds(df, n_splits=5):
-        tr, va = df.iloc[tr_idx], df.iloc[va_idx]
+        tr = df.iloc[tr_idx]; va = df.iloc[va_idx]
         gtr = tr.groupby("session_id", observed=True).size().tolist()
         gva = va.groupby("session_id", observed=True).size().tolist()
         m = xgb.XGBRanker(
@@ -201,7 +217,7 @@ def predict_ensemble(models_lgb_c, models_lgb_o, models_xgb_c, models_xgb_o, tes
         preds = []
         for m in models:
             try:
-                preds.append(m.predict(X, num_iteration=m.best_iteration))
+                preds.append(m.predict(X, num_iteration=getattr(m, "best_iteration", None)))
             except TypeError:
                 preds.append(m.predict(X))
         return np.mean(preds, axis=0)
@@ -241,7 +257,8 @@ def main(args):
     te = add_time_patterns(te)
 
     # model input
-    ignore = ["clicked","ordered","ts_hour","session_id","user_id_hashed","content_id_hashed","search_term_normalized"]
+    ignore = ["clicked","ordered","ts_hour","session_id","user_id_hashed",
+              "content_id_hashed","search_term_normalized"]
     feats = [c for c in tr.columns if c not in ignore]
     cat_cols = [c for c in ["level1_category_name","level2_category_name","leaf_category_name"] if c in tr.columns]
     tr = reduce_cats(tr, cat_cols); te = reduce_cats(te, cat_cols)
