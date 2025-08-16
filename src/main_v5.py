@@ -4,11 +4,18 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import GroupKFold
+from sklearn.linear_model import LinearRegression
 from pathlib import Path
 
 from .helpers import groupwise_rank, reduce_cats, set_global_seed
 from .metric_wrappers import trendyol_final_score, final_metric_from_single_score
-from .build_features_v5 import add_item_ctr_cvr, add_session_features, add_term_item_affinity
+
+from .feature_utils_v5 import (
+    add_item_ctr_cvr,
+    add_session_features,
+    add_term_item_affinity,
+)
+
 import optuna
 
 
@@ -364,8 +371,8 @@ def main(args):
                 models.append(m)
             return models, oof
 
-        cat_click_models, _ = train_cat("clicked")
-        cat_order_models, _ = train_cat("ordered")
+        cat_click_models, oof_click_cat = train_cat("clicked")
+        cat_order_models, oof_order_cat = train_cat("ordered")
 
         def avg_pred(models, X):
             return np.mean([m.predict(X[features]) for m in models], axis=0)
@@ -391,6 +398,66 @@ def main(args):
     # Öğrenilmiş ağırlıklarla final skor
     te_final = w_click_opt * te_click + w_order_opt * te_order
     print(f"[TEST/blend] using w_click={w_click_opt:.3f}, w_order={w_order_opt:.3f}")
+
+    # Meta ağırlıkları hazır değilse OOF üzerinden hesapla (fallback)
+    if 'w' not in locals():
+        df_oof["lgb_click"] = df_oof.get("lgb_click", df_oof["score_click"])  # base OOF
+        df_oof["lgb_order"] = df_oof.get("lgb_order", df_oof["score_order"])  # base OOF
+        if 'oof_click_cat' in locals() and 'oof_order_cat' in locals():
+            df_oof["cat_click"] = oof_click_cat
+            df_oof["cat_order"] = oof_order_cat
+        else:
+            df_oof["cat_click"] = 0.0
+            df_oof["cat_order"] = 0.0
+        _meta_feats = ["lgb_click","lgb_order","cat_click","cat_order"]
+        _y_meta = 0.3 * df_oof["clicked"].values + 0.7 * df_oof["ordered"].values
+        _meta = LinearRegression(positive=True)
+        _meta.fit(df_oof[_meta_feats].values, _y_meta)
+        w = dict(zip(_meta_feats, _meta.coef_))
+        _s = sum(w.values()) if sum(w.values()) > 0 else 1.0
+        for _k in w: w[_k] /= _s
+        print(f"[META] weights normalized (fallback): {w}")
+
+    # Test için de meta feature matrisi
+    te_meta = pd.DataFrame({
+        "lgb_click": te_click,
+        "lgb_order": te_order,
+        "cat_click": cat_preds_click if 'cat_preds_click' in locals() and cat_preds_click is not None else np.zeros_like(te_click),
+        "cat_order": cat_preds_order if 'cat_preds_order' in locals() and cat_preds_order is not None else np.zeros_like(te_order),
+    })
+
+    # (Opsiyonel) meta girişlerini de session içi min-max normalize etmek istersen:
+    def _sess_minmax_cols(df_block, sess):
+        out = {}
+        for col in df_block.columns:
+            v = df_block[col].values
+            df = pd.DataFrame({"s": v, "g": sess.values})
+            g = df.groupby("g")["s"]
+            mn, mx = g.transform("min"), g.transform("max")
+            out[col] = ((df["s"] - mn) / ((mx - mn).replace(0, np.nan))).fillna(0.5).values
+        return pd.DataFrame(out)
+
+    # Eğer stabilizasyonu meta öncesi istiyorsan aç:
+    # te_meta = _sess_minmax_cols(te_meta, te["session_id"])
+
+    # Meta blend: w ile ağırlıklı toplam
+    te_final_meta = (
+        w["lgb_click"]*te_meta["lgb_click"].values +
+        w["lgb_order"]*te_meta["lgb_order"].values +
+        w["cat_click"]*te_meta["cat_click"].values +
+        w["cat_order"]*te_meta["cat_order"].values
+    )
+
+    # Son olarak (önerilir) session içi min-max + hafif clip
+    def sess_minmax(arr, sess):
+        df = pd.DataFrame({"s": arr, "g": sess.values})
+        g = df.groupby("g")["s"]
+        mn, mx = g.transform("min"), g.transform("max")
+        norm = (df["s"] - mn) / ((mx - mn).replace(0, np.nan))
+        return norm.fillna(0.5).values
+
+    te_final = np.clip(sess_minmax(te_final_meta, te["session_id"]), 0.001, 0.999)
+    print("[META] stacked final scores computed.")
 
     # Kaggle-style reranking and submission formatting
     df_pred = te[["session_id","content_id_hashed"]].copy()
