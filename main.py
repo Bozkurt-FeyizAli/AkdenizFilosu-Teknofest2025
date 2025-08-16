@@ -122,8 +122,8 @@ def add_oof_target_encoding(trainX: pd.DataFrame, testX: pd.DataFrame, keys_list
 
 def main(args):
     DATA = Path(args.data_dir)
-    N_SPLITS = 5  # Çapraz validasyon için katman sayısı
-    N_TRIALS = 30 # Her model için Optuna deneme sayısı
+    N_SPLITS = 4  # Çapraz validasyon için katman sayısı
+    N_TRIALS = 25 # Her model için Optuna deneme sayısı
 
     # ADIM 1: ÖZELLİK ÜRETİMİ
     train_feature_path = DATA / "train_features.parquet"
