@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from features.features_v6 import build_features_v6
+from src.features.features_v6 import build_features_v6
 
 def main(args):
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
