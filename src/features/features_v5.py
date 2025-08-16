@@ -164,6 +164,18 @@ def _decay_blocks(data_dir: Path, half_life_days: int = 30):
     })
     return c_search, c_site, t_decay, u_search, u_site
 
+# Term-Content affinity (top terms per content)
+def _term_content_affinity(data_dir: Path):
+    # content/top_terms_log.parquet: (content_id_hashed, search_term_normalized, total_search_click/impression)
+    q = f"""
+    SELECT content_id_hashed, search_term_normalized,
+           avg(total_search_impression) AS tc_imp_avg,
+           avg(total_search_click)      AS tc_clk_avg
+    FROM read_parquet('{(data_dir/'content/top_terms_log.parquet').as_posix()}')
+    GROUP BY content_id_hashed, search_term_normalized
+    """
+    return duck(q)
+
 # ---- MAIN FEATURE BUILDER ----
 def build_features_v5(data_dir: str, is_train=True):
     data_dir = Path(data_dir)
@@ -189,6 +201,11 @@ def build_features_v5(data_dir: str, is_train=True):
                   .merge(u_search_d, on="user_id_hashed", how="left")
                   .merge(u_site_d,   on="user_id_hashed", how="left"))
 
+    # Merge term-content affinity and compute CTR
+    tc = _term_content_affinity(data_dir)
+    df = df.merge(tc, on=["content_id_hashed","search_term_normalized"], how="left")
+    df["tc_ctr"] = safe_div(df["tc_clk_avg"].fillna(0), df["tc_imp_avg"].fillna(0))
+
     # ratios
     df["c_search_ctr"]   = safe_div(df["c_total_search_clk_avg"].fillna(0), df["c_total_search_imp_avg"].fillna(0))
     df["term_ctr"]       = safe_div(df["term_clk_avg"].fillna(0), df["term_imp_avg"].fillna(0))
@@ -197,10 +214,15 @@ def build_features_v5(data_dir: str, is_train=True):
     df["term_ctr_d"]     = safe_div(df["term_clk_decay"].fillna(0), df["term_imp_decay"].fillna(0))
     df["u_term_ctr_d"]   = safe_div(df["u_term_clk_decay"].fillna(0), df["u_term_imp_decay"].fillna(0))
 
-    ts = pd.to_datetime(df["ts_hour"], errors="coerce")
-    df["hour"] = ts.dt.hour
-    df["dow"]  = ts.dt.dayofweek
-    df["acc_age_days"] = (ts.dt.floor("D") - pd.to_datetime(df["content_creation_date"]).dt.floor("D")).dt.days.clip(lower=0)
+    # Fiyat rekabeti
+    df["price_discount_ratio"] = (df["discounted_price_last"] / (df["original_price_last"] + 1e-6)).clip(0, 10)
+    df["log_discounted_price"] = np.log1p(df["discounted_price_last"].clip(lower=0))
+
+    # Oturum içi z-score (göreli konum)
+    for col in ["discounted_price_last","rate_avg_last","review_cnt_last","q_cvtag_tfidf_cos","c_search_ctr_d"]:
+        if col in df.columns:
+            g = df.groupby("session_id")[col]
+            df[f"{col}_z_in_sess"] = (df[col] - g.transform("mean")) / (g.transform("std").replace(0, np.nan))
 
     # tf-idf cosine (term <-> cv_tags)
     try:
@@ -225,6 +247,10 @@ def build_features_v5(data_dir: str, is_train=True):
         "u_term_imp_avg","u_term_clk_avg","u_clk_avg","u_cart_avg","u_fav_avg","u_order_avg",
         "u_term_imp_decay","u_term_clk_decay","u_clk_decay","u_cart_decay","u_fav_decay","u_order_decay",
         "c_search_ctr","term_ctr","u_term_ctr","c_search_ctr_d","term_ctr_d","u_term_ctr_d",
+        "price_discount_ratio","log_discounted_price",
+        "discounted_price_last_z_in_sess","rate_avg_last_z_in_sess","review_cnt_last_z_in_sess",
+        "q_cvtag_tfidf_cos_z_in_sess","c_search_ctr_d_z_in_sess",
+        "tc_imp_avg","tc_clk_avg","tc_ctr",
         "hour","dow","acc_age_days","q_cvtag_overlap","q_cvtag_tfidf_cos",
         "level1_category_name","level2_category_name","leaf_category_name",
     ]

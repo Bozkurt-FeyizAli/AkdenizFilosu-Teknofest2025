@@ -13,6 +13,10 @@ def main(args):
     te.to_parquet(out / "features_v5_test.parquet")
     print("[OK] features_v5_train.parquet & features_v5_test.parquet yazıldı.")
 
+    # Feather cache
+    tr.reset_index(drop=True).to_feather(out / "features_v5_train.feather")
+    te.reset_index(drop=True).to_feather(out / "features_v5_test.feather")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
