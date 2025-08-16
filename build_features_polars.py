@@ -155,6 +155,42 @@ def generate_features(data_dir: Path, is_train: bool):
     end_time = time.time()
     print(f"   - Bitti! {len(final_df):,} satır işlendi ve '{output_path.name}' olarak kaydedildi. Süre: {end_time - start_time:.2f} saniye.")
 
+def add_sequential_features(lazy_df: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Oturum içi sıralı özellikleri ekler.
+    Her bir eylemin, aynı oturumdaki bir önceki eyleme göre değişimini hesaplar.
+    """
+    print("   - Sıralı (sequential) özellikler ekleniyor...")
+    
+    # Oturumları zamana göre sırala
+    df_sorted = lazy_df.sort("ts_hour")
+    
+    # shift() operasyonu ile bir önceki satırdaki değeri al
+    sequential_features = df_sorted.with_columns(
+        # Bir önceki ürünün fiyatı
+        prev_price = pl.col("discounted_price").shift(1).over("session_id"),
+        
+        # Bir önceki ürünün puanı
+        prev_rate_avg = pl.col("content_rate_avg").shift(1).over("session_id"),
+        
+        # Bir önceki ürünün tıklanma oranı (CTR)
+        prev_content_search_ctr = pl.col("content_search_ctr").shift(1).over("session_id"),
+        
+        # Oturum başlangıcından bu yana geçen süre
+        time_since_session_start = (pl.col("ts_hour") - pl.col("ts_hour").first().over("session_id")).dt.total_seconds(),
+        
+        # Oturumdaki kaçıncı ürün olduğu
+        item_rank_in_session = pl.col("ts_hour").rank("ordinal").over("session_id")
+    )
+    
+    # Fark ve oran özellikleri üret
+    final_with_seq = sequential_features.with_columns(
+        price_diff_from_prev = pl.col("discounted_price") - pl.col("prev_price"),
+        rate_avg_diff_from_prev = pl.col("content_rate_avg") - pl.col("prev_rate_avg"),
+        ctr_ratio_from_prev = pl.col("content_search_ctr") / pl.col("prev_content_search_ctr")
+    )
+    
+    return final_with_seq
 
 if __name__ == "__main__":
     # Bu scripti doğrudan çalıştırarak özellik dosyalarını oluşturabilirsiniz.
