@@ -32,3 +32,22 @@ def trendyol_final_score(df, click_label="clicked", order_label="ordered",
     auc_order = auc_grouped_fast(df, order_label, order_score, group_col)
     final = w_click * auc_click + w_order * auc_order
     return final, auc_click, auc_order
+
+def auc_grouped_from_single_score(df, label_col, score_col, group_col):
+    """
+    Tek bir skorla (s) oturum başına AUC: pozitiflerin negatiflerden önde olma olasılığı.
+    Pozitiflerin kendi arası sırası önemli değildir.
+    """
+    return auc_grouped_fast(df[[group_col, label_col, score_col]].copy(),
+                            label_col=label_col, score_col=score_col, group_col=group_col)
+
+def final_metric_from_single_score(df, score_col="s",
+                                   group_col="session_id",
+                                   click_label="clicked", order_label="ordered",
+                                   w_click=0.3, w_order=0.7):
+    """
+    Tek skor s ile iki AUC (click/order) hesaplar ve yarışmanın ağırlıklarıyla toplar.
+    """
+    auc_c = auc_grouped_from_single_score(df, click_label, score_col, group_col)
+    auc_o = auc_grouped_from_single_score(df, order_label, score_col, group_col)
+    return w_click * auc_c + w_order * auc_o, auc_c, auc_o

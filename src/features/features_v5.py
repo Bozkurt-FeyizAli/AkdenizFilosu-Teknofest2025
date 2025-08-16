@@ -233,6 +233,15 @@ def build_features_v5(data_dir: str, is_train=True):
     # token-overlap (ek sinyal)
     df = _term_match_features(df, df)
 
+    # Frequency encodings
+    if {"search_term_normalized","leaf_category_name"}.issubset(df.columns):
+        vc = df.groupby(["search_term_normalized","leaf_category_name"]).size().rename("freq_term_leaf")
+        df = df.merge(vc.reset_index(), on=["search_term_normalized","leaf_category_name"], how="left")
+
+    if {"user_id_hashed","leaf_category_name"}.issubset(df.columns):
+        vc2 = df.groupby(["user_id_hashed","leaf_category_name"]).size().rename("freq_user_leaf")
+        df = df.merge(vc2.reset_index(), on=["user_id_hashed","leaf_category_name"], how="left")
+
     cat_cols = ["level1_category_name","level2_category_name","leaf_category_name"]
     for c in cat_cols:
         if c in df.columns:
@@ -251,6 +260,7 @@ def build_features_v5(data_dir: str, is_train=True):
         "discounted_price_last_z_in_sess","rate_avg_last_z_in_sess","review_cnt_last_z_in_sess",
         "q_cvtag_tfidf_cos_z_in_sess","c_search_ctr_d_z_in_sess",
         "tc_imp_avg","tc_clk_avg","tc_ctr",
+        "freq_term_leaf","freq_user_leaf",
         "hour","dow","acc_age_days","q_cvtag_overlap","q_cvtag_tfidf_cos",
         "level1_category_name","level2_category_name","leaf_category_name",
     ]
@@ -258,8 +268,31 @@ def build_features_v5(data_dir: str, is_train=True):
         df["site_order_rate"] = df["c_total_order_avg"].fillna(0)
         keep_cols.append("site_order_rate")
 
+    # Cold-start flags
+    df["is_cold_content"] = (
+        df[["c_total_search_imp_avg","c_total_clk_avg","c_total_order_avg"]].fillna(0).sum(axis=1) < 1e-6
+    ).astype("int8")
+    df["is_cold_term"] = df[["term_imp_avg","term_clk_avg"]].fillna(0).sum(axis=1).eq(0).astype("int8")
+    df["is_cold_user"] = df[["u_clk_avg","u_cart_avg","u_fav_avg","u_order_avg"]].fillna(0).sum(axis=1).eq(0).astype("int8")
+
+    keep_cols += ["is_cold_content","is_cold_term","is_cold_user"]
+
     if is_train:
         keep_cols += ["clicked","ordered"]
 
     keep_cols = [c for c in keep_cols if c in df.columns]
-    return df[keep_cols]
+    df_out = df[keep_cols]
+
+    # Label hazırlığı (train için 0/1/2)
+    def make_labels(df_in: pd.DataFrame) -> pd.DataFrame:
+        df_in = df_in.copy()
+        df_in["label"] = 0
+        if "clicked" in df_in.columns:
+            df_in.loc[df_in["clicked"] == 1, "label"] = 1
+        if "ordered" in df_in.columns:
+            df_in.loc[df_in["ordered"] == 1, "label"] = 2
+        return df_in
+
+    if is_train:
+        df_out = make_labels(df_out)
+    return df_out
