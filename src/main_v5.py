@@ -22,6 +22,19 @@ import optuna
 NUM_BOOST = 4000
 EARLY_STOP = 200
 
+# LightGBM fit helper with callbacks (version-agnostic)
+def _fit_lgb(dtr, dva, params, num_boost_round, es_rounds):
+    return lgb.train(
+        params,
+        dtr,
+        num_boost_round=num_boost_round,
+        valid_sets=[dva],
+        callbacks=[
+            lgb.early_stopping(es_rounds),     # erken durdurma
+            lgb.log_evaluation(period=0),      # sessiz eğitim (verbose_eval yerine)
+        ],
+    )
+
 def tune_params_with_optuna(train_df, features, label_col, group_col="session_id", n_trials=30, seed=42):
     y = train_df[label_col].values
     gkf = GroupKFold(n_splits=3)
@@ -43,7 +56,7 @@ def tune_params_with_optuna(train_df, features, label_col, group_col="session_id
             gva = va_df.groupby(group_col, observed=True).size().values
             dtr = lgb.Dataset(tr_df[features], label=tr_df[label_col], group=gtr, free_raw_data=False)
             dva = lgb.Dataset(va_df[features], label=va_df[label_col], group=gva, free_raw_data=False)
-            model = lgb.train(params, dtr, 3000, valid_sets=[dva], early_stopping_rounds=150, verbose_eval=False)
+            model = _fit_lgb(dtr, dva, params, num_boost_round=3000, es_rounds=150)
             oof[va] = model.predict(va_df[features], num_iteration=model.best_iteration)
         # group-AUC yerine basit NDCG kullanıyoruz; Optuna sırasında hız/istikrar için
         # Daha hassas istersen trendyol_final_score ile benzer bir objective yazabiliriz.
@@ -94,14 +107,7 @@ def train_head(train_df, features, label_col, group_col="session_id",
         dtr = lgb.Dataset(tr_df[features], label=tr_df[label_col], group=gtr, weight=w_tr, free_raw_data=False)
         dva = lgb.Dataset(va_df[features], label=va_df[label_col], group=gva, weight=w_va, free_raw_data=False)
 
-        model = lgb.train(
-            params,
-            dtr,
-            num_boost_round=NUM_BOOST,
-            valid_sets=[dva],
-            early_stopping_rounds=EARLY_STOP,
-            verbose_eval=False,
-        )
+        model = _fit_lgb(dtr, dva, params, num_boost_round=NUM_BOOST, es_rounds=EARLY_STOP)
 
         oof[va] = model.predict(va_df[features], num_iteration=model.best_iteration)
         models.append(model)
