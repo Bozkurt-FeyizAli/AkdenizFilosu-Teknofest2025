@@ -299,37 +299,60 @@ def add_time_patterns(df: pd.DataFrame) -> pd.DataFrame:
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype, is_datetime64_any_dtype, is_timedelta64_dtype, is_bool_dtype
 
-def reduce_mem_usage(df, verbose=True):
-    """
-    DataFrame içindeki sayısal kolonların tipini küçültür.
-    int64 → int32/int16
-    float64 → float32
-    """
-    start_mem = df.memory_usage().sum() / 1024**2
+
+def reduce_mem_usage(df: pd.DataFrame, use_float16=True, verbose=True):
+    start_mem = df.memory_usage(deep=True).sum() / 1024**2
+
     for col in df.columns:
-        col_type = df[col].dtype
-        if col_type != object:
-            c_min = df[col].min()
-            c_max = df[col].max()
-            if str(col_type)[:3] == "int":
-                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                    df[col] = df[col].astype(np.int8)
-                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                    df[col] = df[col].astype(np.int16)
-                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                    df[col] = df[col].astype(np.int32)
+        col_series = df[col]
+
+        # Datetime/timedelta/bool/object → sıkıştırma deneme, sadece kategorikleştir
+        if is_datetime64_any_dtype(col_series) or is_timedelta64_dtype(col_series) or not is_numeric_dtype(col_series):
+            # İsteğe bağlı: az unique ise category yap
+            if col_series.dtype == 'object':
+                nunique = col_series.nunique(dropna=False)
+                if nunique / max(1, len(col_series)) < 0.5:
+                    df[col] = col_series.astype('category')
+            continue
+
+        if is_bool_dtype(col_series):
+            df[col] = col_series.astype(np.uint8)
+            continue
+
+        c_min = col_series.min()
+        c_max = col_series.max()
+
+        if str(col_series.dtype).startswith('int'):
+            if c_min >= 0:
+                if c_max < 255:
+                    df[col] = col_series.astype(np.uint8)
+                elif c_max < 65535:
+                    df[col] = col_series.astype(np.uint16)
+                elif c_max < 4294967295:
+                    df[col] = col_series.astype(np.uint32)
                 else:
-                    df[col] = df[col].astype(np.int64)    
+                    df[col] = col_series.astype(np.uint64)
             else:
-                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
-                    df[col] = df[col].astype(np.float16)
-                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
-                    df[col] = df[col].astype(np.float32)
+                if np.iinfo(np.int8).min <= c_min and c_max <= np.iinfo(np.int8).max:
+                    df[col] = col_series.astype(np.int8)
+                elif np.iinfo(np.int16).min <= c_min and c_max <= np.iinfo(np.int16).max:
+                    df[col] = col_series.astype(np.int16)
+                elif np.iinfo(np.int32).min <= c_min and c_max <= np.iinfo(np.int32).max:
+                    df[col] = col_series.astype(np.int32)
                 else:
-                    df[col] = df[col].astype(np.float64)
-    end_mem = df.memory_usage().sum() / 1024**2
+                    df[col] = col_series.astype(np.int64)
+        else:
+            # float kolonlar
+            if use_float16 and (c_min > np.finfo(np.float16).min) and (c_max < np.finfo(np.float16).max):
+                df[col] = col_series.astype(np.float16)
+            elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                df[col] = col_series.astype(np.float32)
+            else:
+                df[col] = col_series.astype(np.float64)
+
+    end_mem = df.memory_usage(deep=True).sum() / 1024**2
     if verbose:
-        print(f"Mem. usage decreased from {start_mem:.2f} MB to {end_mem:.2f} MB "
-              f"({100 * (start_mem - end_mem) / start_mem:.1f}% reduction)")
+        print(f"Mem: {start_mem:.2f} MB → {end_mem:.2f} MB ({100*(start_mem-end_mem)/max(1e-9,start_mem):.1f}% azalma)")
     return df
