@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import duckdb
 from typing import List, Tuple, Iterable, Optional
+from pathlib import Path
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -87,9 +88,9 @@ def tfidf_cosine_sparse(a_texts: pd.Series, b_texts: pd.Series,
     """
     v6.1 için: term ↔ cv_tags TF-IDF uzayında kosinüs.
     Aşırı büyük olmaması için max_features kullanılır.
+    NOT: Kaggle'da numpy.matrix ile çarpım sorununu önlemek için .A1 kullanılır.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
-    import scipy.sparse as sp
 
     A = a_texts.fillna("").astype(str).values
     B = b_texts.fillna("").astype(str).values
@@ -97,10 +98,11 @@ def tfidf_cosine_sparse(a_texts: pd.Series, b_texts: pd.Series,
     X = vec.fit_transform(np.concatenate([A, B], axis=0))
     Xa = X[: len(A)]; Xb = X[len(A):]
 
-    # satır bazlı diyagonal dot → cosine
-    numer = (Xa.multiply(Xb)).sum(axis=1)
-    denom = np.sqrt(Xa.multiply(Xa).sum(axis=1)) * np.sqrt(Xb.multiply(Xb).sum(axis=1))
-    sim = np.asarray(numer / (denom + 1e-9)).ravel()
+    # satır bazlı diyagonal dot → cosine (1D array olarak hesapla)
+    numer = (Xa.multiply(Xb)).sum(axis=1).A1
+    norm_a = np.sqrt(Xa.multiply(Xa).sum(axis=1)).A1
+    norm_b = np.sqrt(Xb.multiply(Xb).sum(axis=1)).A1
+    sim = numer / (norm_a * norm_b + 1e-9)
     return sim
 
 
