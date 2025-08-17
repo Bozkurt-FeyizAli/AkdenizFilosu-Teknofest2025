@@ -152,7 +152,8 @@ def main(args):
 
     # Temel ignore listesi
     ignore = [
-        "clicked","ordered","ts_hour","session_id",
+        "clicked","ordered","label",  # 'label' kesinlikle hariç
+        "ts_hour","session_id",
         "user_id_hashed","content_id_hashed","search_term_normalized"
     ]
     features = [c for c in tr.columns if c not in ignore]
@@ -203,7 +204,7 @@ def main(args):
         c for c in tr.columns
         if c not in [
             "session_id","content_id_hashed","user_id_hashed","search_term_normalized","ts_hour",
-            "clicked","ordered"
+            "clicked","ordered","label"  # 'label' yine hariç
         ]
     ]
 
@@ -228,6 +229,15 @@ def main(args):
     te["sess_size"] = te.groupby("session_id")["content_id_hashed"].transform("size")
     if "sess_size" not in features:
         features.append("sess_size")
+
+    # --- Sağlamlık: testte bulunmayan feature'ları düşür (ör. 'label')
+    # Ayrıca yanlışlıkla kalan 'label' benzeri hedef isimlerini filtrele
+    reserved_like = {"label", "target", "score", "rank"}
+    features = [f for f in features if f not in reserved_like]
+    missing_in_te = [c for c in features if c not in te.columns]
+    if missing_in_te:
+        print(f"[WARN] dropping features missing in test: {missing_in_te}")
+        features = [c for c in features if c in te.columns]
 
     # Optuna (hafif): istersen kapat -> use_optuna=False yap
     use_optuna = True
