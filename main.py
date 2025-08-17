@@ -122,7 +122,7 @@ def add_oof_target_encoding(trainX: pd.DataFrame, testX: pd.DataFrame, keys_list
 
 def main(args):
     DATA = Path(args.data_dir)
-    N_SPLITS = 4  # Çapraz validasyon için katman sayısı
+    N_SPLITS = 3  # Çapraz validasyon için katman sayısı
     N_TRIALS = 25 # Her model için Optuna deneme sayısı
 
     # ADIM 1: ÖZELLİK ÜRETİMİ
