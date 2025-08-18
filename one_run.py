@@ -1124,14 +1124,21 @@ def run_infer_ensemble(out_path: str,
     ).astype("float32")
 
     # oturum içi sinyalleri getir ve küçük bonus ver
-    df = df.merge(
-        feats_te[["session_id","content_id_hashed",
-                  "seen_before",
-                  "clicked_before_item_sess",
-                  "added_to_cart_before_item_sess",
-                  "added_to_fav_before_item_sess"]],
-        on=key, how="left"
-    )
+    # Eksik olabilecek in-session kolonlarını güvenle oluştur
+    missing_cols = [
+        "clicked_before_item_sess",
+        "added_to_cart_before_item_sess",
+        "added_to_fav_before_item_sess",
+    ]
+    for c in missing_cols:
+        if c not in feats_te.columns:
+            feats_te[c] = 0.0
+    if "seen_before" not in feats_te.columns:
+        feats_te["seen_before"] = 0.0
+    sel_cols = key + ["seen_before"] + missing_cols
+    feats_te[sel_cols] = feats_te[sel_cols].fillna(0)
+
+    df = df.merge(feats_te[sel_cols], on=key, how="left")
 
     df["repeat_bonus"] = (
         0.02 * df["seen_before"].fillna(0) +
