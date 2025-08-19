@@ -38,20 +38,20 @@ os.makedirs("outputs", exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Merkezi CPU thread sayısı belirleyici + env ayarları
-def _detect_threads(max_cap: int = 32) -> int:
+def _detect_threads(max_cap: int = 64) -> int:
     try:
         cpu = os.cpu_count() or 4
     except Exception:
         cpu = 4
-    # 1 çekirdeği sistem için boş bırak, üst limiti kısıtla
-    n = max(1, min(max_cap, cpu - 1))
+    # Tüm çekirdekleri kullan, daha yüksek performans için
+    n = max(1, min(max_cap, cpu))
     return n
 
 N_THREADS = _detect_threads()
-# BLAS/OMP için güvenli varsayılanlar
+# BLAS/OMP için güvenli varsayılanlar + bellek optimizasyonu
 for _env in [
     "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS", 
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
@@ -61,6 +61,14 @@ for _env in [
         os.environ.setdefault(_env, str(N_THREADS))
     except Exception:
         pass
+
+# Bellek optimizasyonu için ek ayarlar
+try:
+    os.environ.setdefault("MALLOC_ARENA_MAX", "4")  # malloc arena sayısını sınırla
+    os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "131072")  # mmap threshold
+    os.environ.setdefault("PYTHONHASHSEED", "42")  # hash seed sabit
+except Exception:
+    pass
 
 
 def gpu_available() -> bool:
@@ -121,7 +129,7 @@ def _mk_roll(win: int, alias_prefix: str, col: str, part_cols: str) -> str:
             f"RANGE BETWEEN INTERVAL {win} DAY PRECEDING AND CURRENT ROW) "
             f"AS {alias_prefix}_{win}d")
 
-def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.DataFrame:
+def assemble_timeaware_features(sessions: pd.DataFrame, windows=(3,7,14,30,60,90)) -> pd.DataFrame:
     print("[TA] DuckDB builder -> start")
     need = [c for c in [
         "ts_hour","search_term_normalized","content_id_hashed","session_id",
@@ -133,8 +141,13 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
 
     con = duckdb.connect()
     try:
-        # DuckDB thread sayısını merkezi ayar ile yükselt
+        # DuckDB thread sayısını merkezi ayar ile yükselt + bellek optimizasyonu
         con.execute(f"PRAGMA threads={N_THREADS};")
+        con.execute(f"PRAGMA memory_limit='26GB';")  # Maximum RAM kullanımı (30GB sistemde güvenli)
+        con.execute("PRAGMA enable_progress_bar=false;")  # Progress bar kapatarak performans artış
+        con.execute("PRAGMA enable_profiling=false;")
+        con.execute("PRAGMA max_memory='26GB';")  # Ek bellek limiti ayarı
+        con.execute("PRAGMA temp_directory='/tmp';")  # Hızlı temp directory
     except Exception:
         pass
     con.register("sessions_df", s)
@@ -173,7 +186,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             FROM read_parquet('{DATA_DIR}/content/sitewide_log.parquet') sw
             JOIN key_c USING (content_id_hashed)
             WHERE CAST(sw.date AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT content_id_hashed, d, {", ".join(sw_roll_exprs)}
         FROM sw ORDER BY content_id_hashed, d
@@ -195,13 +208,13 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             JOIN key_ct k
               ON k.content_id_hashed=c.content_id_hashed AND k.search_term_normalized=c.search_term_normalized
             WHERE CAST(c.date AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT content_id_hashed, search_term_normalized, d, {", ".join(tt_roll_exprs)}
         FROM ctt ORDER BY content_id_hashed, search_term_normalized, d
     """)
 
-    # price / rating son değer
+    # price / rating / review son değer (genişletilmiş)
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW prr AS
         SELECT p.content_id_hashed, CAST(p.update_date AS DATE) AS d,
@@ -209,11 +222,13 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
                CAST(p.selling_price AS DOUBLE) AS selling_price,
                CAST(p.discounted_price AS DOUBLE) AS discounted_price,
                CAST(p.content_rate_avg AS DOUBLE) AS rate_avg,
-               CAST(p.content_rate_count AS DOUBLE) AS rate_cnt
+               CAST(p.content_rate_count AS DOUBLE) AS rate_cnt,
+               CAST(p.content_review_count AS DOUBLE) AS review_cnt,
+               CAST(p.content_review_wth_media_count AS DOUBLE) AS review_media_cnt
         FROM read_parquet('{DATA_DIR}/content/price_rate_review_data.parquet') p
         JOIN key_c USING (content_id_hashed)
         WHERE CAST(p.update_date AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
     """)
 
     # user×term 30g
@@ -227,7 +242,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             FROM read_parquet('{DATA_DIR}/user/top_terms_log.parquet') u
             JOIN key_ut k ON k.user_id_hashed=u.user_id_hashed AND k.search_term_normalized=u.search_term_normalized
             WHERE CAST(u.ts_hour AS DATE) BETWEEN
-                (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+                (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT user_id_hashed, search_term_normalized, d,
                SUM(imp) OVER (PARTITION BY user_id_hashed, search_term_normalized
@@ -257,7 +272,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             FROM read_parquet('{DATA_DIR}/user/sitewide_log.parquet')
             JOIN key_u USING (user_id_hashed)
             WHERE CAST(ts_hour AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT user_id_hashed, d, {", ".join(u_sw_exprs)}
         FROM u ORDER BY user_id_hashed, d
@@ -279,7 +294,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             FROM read_parquet('{DATA_DIR}/user/search_log.parquet')
             JOIN key_u USING (user_id_hashed)
             WHERE CAST(ts_hour AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT user_id_hashed, d, {", ".join(u_search_exprs)}
         FROM u ORDER BY user_id_hashed, d
@@ -301,7 +316,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             FROM read_parquet('{DATA_DIR}/content/search_log.parquet')
             JOIN key_c USING (content_id_hashed)
             WHERE CAST(date AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT content_id_hashed, d, {", ".join(c_search_exprs)}
         FROM c ORDER BY content_id_hashed, d
@@ -322,7 +337,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
                    CAST(total_search_click      AS DOUBLE) AS total_search_click
             FROM read_parquet('{DATA_DIR}/term/search_log.parquet')
             WHERE CAST(ts_hour AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT search_term_normalized, d, {", ".join(t_search_exprs)}
         FROM t ORDER BY search_term_normalized, d
@@ -339,7 +354,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             FROM read_parquet('{DATA_DIR}/user/fashion_search_log.parquet')
             JOIN key_uc USING (user_id_hashed, content_id_hashed)
             WHERE CAST(ts_hour AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT user_id_hashed, content_id_hashed, d,
                SUM(imp) OVER (PARTITION BY user_id_hashed, content_id_hashed
@@ -362,7 +377,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             FROM read_parquet('{DATA_DIR}/user/fashion_sitewide_log.parquet')
             JOIN key_uc USING (user_id_hashed, content_id_hashed)
             WHERE CAST(ts_hour AS DATE) BETWEEN
-              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+              (SELECT min_d - INTERVAL 120 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
         )
         SELECT user_id_hashed, content_id_hashed, d,
                SUM(total_click) OVER (PARTITION BY user_id_hashed, content_id_hashed
@@ -376,7 +391,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM ufs ORDER BY user_id_hashed, content_id_hashed, d
     """)
 
-    # meta: genişletilmiş
+    # meta: genişletilmiş (CV tags ve kategori bilgileri dahil)
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW meta AS
         SELECT content_id_hashed,
@@ -384,7 +399,11 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
                CAST(attribute_type_count AS DOUBLE) AS attr_type_cnt,
                CAST(total_attribute_option_count AS DOUBLE) AS attr_opt_cnt,
                CAST(merchant_count AS DOUBLE) AS merchant_cnt,
-               CAST(filterable_label_count AS DOUBLE) AS filter_label_cnt
+               CAST(filterable_label_count AS DOUBLE) AS filter_label_cnt,
+               level1_category_name,
+               level2_category_name,
+               leaf_category_name,
+               cv_tags
         FROM read_parquet('{DATA_DIR}/content/metadata.parquet')
     """)
 
@@ -428,6 +447,10 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             LOG(1 + COALESCE(prrf.selling_price,0)) AS log_selling_price,
             LOG(1 + COALESCE(prrf.discounted_price,0)) AS log_discounted_price,
             LOG(1 + COALESCE(prrf.rate_cnt,0)) AS rating_log_cnt,
+            -- NEW: review features
+            LOG(1 + COALESCE(prrf.review_cnt,0)) AS review_log_cnt,
+            LOG(1 + COALESCE(prrf.review_media_cnt,0)) AS review_media_log_cnt,
+            CASE WHEN prrf.review_cnt > 0 THEN prrf.review_media_cnt / prrf.review_cnt ELSE 0 END AS review_media_ratio,
             (COALESCE(utf.u_clk_30d,0)+1.0)/(COALESCE(utf.u_imp_30d,0)+1.0+3.0) AS user_term_ctr_30d,
             -- NEW: user sitewide rates
             {', '.join([f"(COALESCE(uswf.u_sw_cart_{w}d,0)+1.0)/(COALESCE(uswf.u_sw_click_{w}d,0)+1.0+3.0) AS user_sw_cart_rate_{w}d" for w in windows])},
@@ -444,6 +467,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             (COALESCE(ufsr.uf_sw_order_30d,0)+1.0)/(COALESCE(ufsr.uf_sw_click_30d,0)+1.0+3.0) AS user_content_fashion_order_rate_30d,
             COALESCE(DATEDIFF('day', m.creation_date, s.sdate), -1) AS days_since_creation,
             m.attr_type_cnt, m.attr_opt_cnt, m.merchant_cnt, m.filter_label_cnt,
+            m.level1_category_name, m.level2_category_name, m.leaf_category_name, m.cv_tags,
             um.user_gender_code, um.user_birth_year, um.user_tenure_days
         FROM s
         LEFT JOIN LATERAL (
@@ -459,7 +483,8 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             ORDER BY r.d DESC LIMIT 1
         ) AS ttf ON TRUE
         LEFT JOIN LATERAL (
-            SELECT r.d, r.selling_price, r.discounted_price, r.original_price, r.rate_avg, r.rate_cnt
+            SELECT r.d, r.selling_price, r.discounted_price, r.original_price, r.rate_avg, r.rate_cnt,
+                   r.review_cnt, r.review_media_cnt
             FROM prr r WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
             ORDER BY r.d DESC LIMIT 1
         ) AS prrf ON TRUE
@@ -657,8 +682,8 @@ def split_time_holdout(df: pd.DataFrame, holdout_days=7, fallback_q=0.8):
 
 # ---------------------- LTR (LightGBM LambdaRank) ----------------------
 def _callbacks():
-    return [lgb.early_stopping(stopping_rounds=400, verbose=True),
-            lgb.log_evaluation(period=100)]
+    return [lgb.early_stopping(stopping_rounds=600, verbose=True),  # 400 -> 600 (daha uzun patience)
+            lgb.log_evaluation(period=200)]  # 100 -> 200 (daha az log spam)
 
 def _group_counts(df: pd.DataFrame) -> np.ndarray:
     return df.groupby("session_id").size().astype(int).values
@@ -672,17 +697,23 @@ def train_ltr_models(tr: pd.DataFrame, va: pd.DataFrame, feat_cols: list):
         "metric": "ndcg",
         "eval_at": [5, 10, 20, 100],
         "boosting": "gbdt",
-        "learning_rate": 0.06,
-        "num_leaves": 63,
-        "max_depth": -1,
-        "min_data_in_leaf": 40,
-        "feature_fraction": 0.9,
-        "bagging_fraction": 0.8,
+        "learning_rate": 0.04,  # 0.06 -> 0.04 (daha düşük lr)
+        "num_leaves": 127,  # 63 -> 127 (daha kompleks model)
+        "max_depth": 12,  # -1 -> 12 (daha derin ağaçlar)
+        "min_data_in_leaf": 30,  # 40 -> 30 (daha az minimum sample)
+        "feature_fraction": 0.85,  # 0.9 -> 0.85 (biraz daha az feature)
+        "bagging_fraction": 0.85,  # 0.8 -> 0.85 (daha fazla sample)
         "bagging_freq": 1,
+        "lambda_l1": 0.1,  # Yeni: L1 regularization
+        "lambda_l2": 0.2,  # Yeni: L2 regularization
+        "min_gain_to_split": 0.01,  # Yeni: minimum gain threshold
         "verbose": -1,
-        "num_threads": N_THREADS,  # çok çekirdekli
+        "num_threads": N_THREADS,
+        "device_type": ("gpu" if gpu_available() else "cpu"),  # GPU desteği
+        "max_bin": (1024 if gpu_available() else 512),  # Daha fazla RAM ile daha yüksek bin
+        "histogram_pool_size": (256 if gpu_available() else 128),  # Histogram pool boyutu
     }
-    m_click = lgb.train(params_click, dtr, num_boost_round=6000,
+    m_click = lgb.train(params_click, dtr, num_boost_round=10000,  # 6000 -> 10000 (daha uzun eğitim)
                         valid_sets=[dtr, dva], valid_names=["train", "valid"],
                         callbacks=_callbacks())
     # order
@@ -693,17 +724,23 @@ def train_ltr_models(tr: pd.DataFrame, va: pd.DataFrame, feat_cols: list):
         "metric": "ndcg",
         "eval_at": [5, 10, 20, 100],
         "boosting": "gbdt",
-        "learning_rate": 0.06,
-        "num_leaves": 63,
-        "max_depth": -1,
-        "min_data_in_leaf": 40,
-        "feature_fraction": 0.9,
-        "bagging_fraction": 0.8,
+        "learning_rate": 0.04,  # 0.06 -> 0.04 (daha düşük lr)
+        "num_leaves": 127,  # 63 -> 127 (daha kompleks model)
+        "max_depth": 12,  # -1 -> 12 (daha derin ağaçlar)
+        "min_data_in_leaf": 30,  # 40 -> 30 (daha az minimum sample)
+        "feature_fraction": 0.85,  # 0.9 -> 0.85 (biraz daha az feature)
+        "bagging_fraction": 0.85,  # 0.8 -> 0.85 (daha fazla sample)
         "bagging_freq": 1,
+        "lambda_l1": 0.1,  # Yeni: L1 regularization
+        "lambda_l2": 0.2,  # Yeni: L2 regularization
+        "min_gain_to_split": 0.01,  # Yeni: minimum gain threshold
         "verbose": -1,
-        "num_threads": N_THREADS,  # çok çekirdekli
+        "num_threads": N_THREADS,
+        "device_type": ("gpu" if gpu_available() else "cpu"),  # GPU desteği
+        "max_bin": (1024 if gpu_available() else 512),  # Daha fazla RAM ile daha yüksek bin
+        "histogram_pool_size": (256 if gpu_available() else 128),  # Histogram pool boyutu
     }
-    m_order = lgb.train(params_order, dtr, num_boost_round=6000,
+    m_order = lgb.train(params_order, dtr, num_boost_round=10000,  # 6000 -> 10000 (daha uzun eğitim)
                         valid_sets=[dtr, dva], valid_names=["train", "valid"],
                         callbacks=_callbacks())
     return m_click, m_order
@@ -788,15 +825,28 @@ def run_train_xgb():
         eval_metric=["ndcg@5","ndcg@10","ndcg@100"],
         tree_method=("gpu_hist" if use_gpu else "hist"),
         predictor=("gpu_predictor" if use_gpu else "auto"),
-        max_depth=8,
-        n_estimators=2400,
-        learning_rate=0.055,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.0,
-        reg_lambda=1.0,
+        max_depth=10,  # 8 -> 10 (daha derin ağaçlar)
+        n_estimators=4800,  # 2400 -> 4800 (2x artış, daha uzun eğitim)
+        learning_rate=0.035,  # 0.055 -> 0.035 (daha düşük lr)
+        subsample=0.85,  # 0.8 -> 0.85 (biraz daha fazla veri)
+        colsample_bytree=0.85,  # 0.8 -> 0.85 (daha fazla feature)
+        colsample_bylevel=0.8,  # Yeni: seviye bazında feature sampling
+        colsample_bynode=0.8,   # Yeni: node bazında feature sampling
+        reg_alpha=0.1,  # 0.0 -> 0.1 (L1 regularization)
+        reg_lambda=1.5,  # 1.0 -> 1.5 (daha güçlü L2 regularization)
+        gamma=0.1,  # Yeni: minimum split loss
+        min_child_weight=3,  # Yeni: minimum örneklem ağırlığı
         random_state=42,
         n_jobs=N_THREADS,
+        # GPU-specific optimizations
+        **({
+            "gpu_id": 0,
+            "max_bin": 1024,  # GPU için daha yüksek bin sayısı (daha fazla RAM ile)
+            "tree_learner": "gpu",
+        } if use_gpu else {
+            "max_bin": 512,  # CPU için orta seviye bin sayısı
+            "max_cached_hist_node": 65536,  # Cache boyutu artırıldı
+        })
     )
     ranker.fit(
         X_tr, y_tr,
@@ -804,7 +854,7 @@ def run_train_xgb():
         eval_set=[(X_va, y_va)],
         eval_group=[group_va.tolist()],
         verbose=True,
-        early_stopping_rounds=400,
+        early_stopping_rounds=600,  # 400 -> 600 (daha uzun patience)
     )
 
 
@@ -871,18 +921,27 @@ def run_train_cat():
     model = CatBoostRanker(
         loss_function="YetiRank",
         eval_metric="NDCG:top=10",
-        iterations=4000,
-        learning_rate=0.05,
-        depth=8,
-        l2_leaf_reg=3.0,
-        random_strength=1.0,
+        iterations=8000,  # 4000 -> 8000 (2x artış, daha uzun eğitim)
+        learning_rate=0.03,  # 0.05 -> 0.03 (daha düşük lr ile daha stabil öğrenme)
+        depth=10,  # 8 -> 10 (daha derin ağaçlar, karmaşık pattern'lar)
+        l2_leaf_reg=2.0,  # 3.0 -> 2.0 (biraz daha az regularization)
+        random_strength=0.8,  # 1.0 -> 0.8 (biraz daha az noise)
         bootstrap_type="Bayesian",
+        bagging_temperature=0.8,  # Yeni: Bayesian bootstrap için sıcaklık
         od_type="Iter",
-        od_wait=400,
-        verbose=100,
+        od_wait=800,  # 400 -> 800 (daha uzun early stopping patience)
+        verbose=200,  # 100 -> 200 (daha az log spam)
         random_seed=42,
         thread_count=N_THREADS,
         task_type=("GPU" if gpu_available() else "CPU"),
+        # GPU varsa ek optimizasyonlar
+        **({
+            "gpu_ram_part": 0.9,  # GPU memory'nin %90'ını kullan (daha agresif)
+            "devices": "0",  # İlk GPU'yu kullan
+            "pinned_memory_size": "2GB",  # Pinned memory
+        } if gpu_available() else {
+            "used_ram_limit": "24GB",  # CPU modunda RAM limiti
+        })
     )
 
     model.fit(train_pool, eval_set=valid_pool, use_best_model=True)
@@ -1348,4 +1407,4 @@ if __name__ == "__main__":
               "  python one_run.py --train_cat\n"
               "  python one_run.py --infer_cat --out outputs/sub_cat.csv\n"
               "  python one_run.py --infer_blend --alpha 0.80 --beta 0.30 --out outputs/sub_blend.csv\n"
-              "  python one_run.py --infer_ensemble --alpha 0.80 --w_ltr 0.55 --w_xgb 0.20 --w_cb 0.20 --w_ta 0.05 --out outputs/sub_ens.csv")
+              "  python one_run.py --infer_ensemble --alpha 0.80 --w_ltr 0.50 --w_xgb 0.25 --w_cb 0.20 --w_ta 0.05 --out outputs/sub_ens.csv")
