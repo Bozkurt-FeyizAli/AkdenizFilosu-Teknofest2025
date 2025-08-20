@@ -15,6 +15,7 @@ Komutlar (örnekler en altta):
 import os, time, argparse, numpy as np, pandas as pd
 import duckdb
 import lightgbm as lgb
+import gc  # Garbage collection için
 
 # XGBoost & CatBoost opsiyonel — sistemde yoksa import hatası vermesin
 try:
@@ -107,7 +108,7 @@ def _mk_roll(win: int, alias_prefix: str, col: str, part_cols: str) -> str:
             f"RANGE BETWEEN INTERVAL {win} DAY PRECEDING AND CURRENT ROW) "
             f"AS {alias_prefix}_{win}d")
 
-def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30,60)) -> pd.DataFrame:
+def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.DataFrame:
     print("[TA] DuckDB builder -> start")
     need = [c for c in [
         "ts_hour","search_term_normalized","content_id_hashed","session_id",
@@ -119,11 +120,13 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30,60)) -> pd
 
     con = duckdb.connect()
     try:
-        # Hesaplama kapasitesini artır
-        con.execute(f"PRAGMA threads={N_THREADS};")
-        con.execute(f"PRAGMA memory_limit='{MEMORY_LIMIT_GB}GB';")
+        # Bellek optimizasyonu - RAM kullanımını sınırla
+        con.execute(f"PRAGMA threads={min(N_THREADS, 4)};")  # Thread sayısını sınırla
+        con.execute(f"PRAGMA memory_limit='16GB';")  # Bellek sınırını düşür
+        con.execute("PRAGMA temp_directory='/tmp';")  # Temp dosyaları disk kullan
         con.execute("PRAGMA enable_optimizer=true;")
-        con.execute("PRAGMA force_parallelism=true;")
+        con.execute("PRAGMA force_parallelism=false;")  # Parallellik azalt
+        con.execute("PRAGMA max_temp_directory_size='8GB';")  # Temp boyutunu sınırla
     except Exception:
         pass
     con.register("sessions_df", s)
@@ -571,6 +574,10 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30,60)) -> pd
 
     out = reduce_memory_df(out)
     print("[TA] DuckDB builder -> done")
+    
+    # Bellek temizliği
+    gc.collect()
+    
     return out
 
 
@@ -860,7 +867,7 @@ def run_train_xgb():
     assert XGBRanker is not None, "xgboost kurulu değil: pip install xgboost"
     print("[TIMER] XGBRanker train ...")
     train = load_train_sessions()
-    feats = assemble_timeaware_features(train, windows=(3, 7, 14, 30, 60))  # Daha fazla pencere
+    feats = assemble_timeaware_features(train, windows=(7, 30))  # Bellek için azaltıldı
     feat_cols = get_numeric_feature_cols(feats)
 
     tr, va = split_time_holdout(feats, holdout_days=7)
@@ -878,7 +885,7 @@ def run_train_xgb():
         eval_metric=["ndcg@5","ndcg@10","ndcg@100"],
         tree_method="hist",
         max_depth=10,           # Artırıldı
-        n_estimators=4000,      # Artırıldı  
+        n_estimators=1000,      # Early stopping olmadığı için azaltıldı
         learning_rate=0.045,    # Azaltıldı (daha fazla ağaç için)
         subsample=0.75,         # Azaltıldı (regularization)
         colsample_bytree=0.75,  # Azaltıldı (regularization)
@@ -887,13 +894,14 @@ def run_train_xgb():
         random_state=42,
         n_jobs=N_THREADS,       # Thread sayısı eklendi
     )
+    # XGBoost 2.1.1+ için early_stopping_rounds parametresi fit() metodunda desteklenmiyor
+    # Basit çözüm: early stopping olmadan eğit ve daha az epoch kullan
     ranker.fit(
         X_tr, y_tr,
         group=group_tr.tolist(),
         eval_set=[(X_va, y_va)],
         eval_group=[group_va.tolist()],
-        verbose=True,
-        early_stopping_rounds=600,  # Daha uzun sabır
+        verbose=True
     )
 
 
@@ -901,13 +909,18 @@ def run_train_xgb():
     ranker.save_model("models/xgb_rank.json")
     pd.Series(feat_cols).to_csv("models/xgb_rank_features.txt", index=False, header=False)
     print("[XGB] model saved -> models/xgb_rank.json & xgb_rank_features.txt")
+    
+    # Bellek temizliği
+    del ranker, feats, tr, va
+    gc.collect()
+    
     print("[TIMER] XGBRanker train done")
 
 def run_infer_xgb(out_path: str):
     assert xgb is not None, "xgboost kurulu değil: pip install xgboost"
     print("[TIMER] XGBRanker infer ...")
     test = load_test_sessions()
-    feats_te = assemble_timeaware_features(test, windows=(3, 7, 14, 30, 60))  # Daha fazla pencere
+    feats_te = assemble_timeaware_features(test, windows=(7, 30))  # Daha fazla pencere
 
     feat_cols = pd.read_csv("models/xgb_rank_features.txt", header=None).iloc[:,0].tolist()
     X_te = to_float32(ensure_feature_columns(feats_te, feat_cols), feat_cols).values
@@ -930,7 +943,7 @@ def run_train_cat():
     assert CatBoostRanker is not None, "catboost kurulu değil: pip install catboost"
     print("[TIMER] CatBoost YetiRank train ...")
     train = load_train_sessions()
-    feats = assemble_timeaware_features(train, windows=(3, 7, 14, 30, 60))  # Daha fazla pencere
+    feats = assemble_timeaware_features(train, windows=(7, 30))  # Daha fazla pencere
     feat_cols = get_numeric_feature_cols(feats)
 
     tr, va = split_time_holdout(feats, holdout_days=7)
@@ -1007,7 +1020,7 @@ def run_infer_cat(out_path: str):
     assert CatBoostRanker is not None, "catboost kurulu değil: pip install catboost"
     print("[TIMER] CatBoost YetiRank infer ...")
     test = load_test_sessions()
-    feats_te = assemble_timeaware_features(test, windows=(3, 7, 14, 30, 60))  # Daha fazla pencere
+    feats_te = assemble_timeaware_features(test, windows=(7, 30))  # Daha fazla pencere
     df = _sort_for_grouping(feats_te)
 
     feat_cols = pd.read_csv("models/cb_rank_features.txt", header=None).iloc[:,0].tolist()
@@ -1078,14 +1091,14 @@ def run_baseline_timeaware(out_path: str):
     set_seed(42)
     with timer("baseline_timeaware"):
         train = load_train_sessions()
-        feats_tr = assemble_timeaware_features(train, windows=(3,7,14,30,60))  # Daha fazla pencere
+        feats_tr = assemble_timeaware_features(train, windows=(7,30))  # Daha fazla pencere
         scored_tr = score_timeaware_baseline(feats_tr)
         tr, va = split_time_holdout(scored_tr, holdout_days=7)
         va = normalize_in_session(va, "pred_final")
         print("[INFO] TA valid prepared.")
 
         test = load_test_sessions()
-        feats_te = assemble_timeaware_features(test, windows=(3,7,14,30,60))  # Daha fazla pencere
+        feats_te = assemble_timeaware_features(test, windows=(7,30))  # Daha fazla pencere
         scored_te = score_timeaware_baseline(feats_te)
         scored_te = normalize_in_session(scored_te, "pred_final")
 
@@ -1097,7 +1110,7 @@ def run_train_ltr(alpha: float):
     set_seed(42)
     with timer("LTR train"):
         train = load_train_sessions()
-        feats = assemble_timeaware_features(train, windows=(3,7,14,30,60))  # Daha fazla pencere
+        feats = assemble_timeaware_features(train, windows=(7,30))  # Daha fazla pencere
         feat_cols = _feature_cols(feats)
         tr, va = split_time_holdout(feats, holdout_days=7)
         m_click, m_order = train_ltr_models(tr, va, feat_cols)
@@ -1121,7 +1134,7 @@ def run_infer_ltr(out_path: str, alpha: float):
     set_seed(42)
     with timer("LTR infer"):
         test = load_test_sessions()
-        feats_te = assemble_timeaware_features(test, windows=(3,7,14,30,60))  # Daha fazla pencere
+        feats_te = assemble_timeaware_features(test, windows=(7,30))  # Daha fazla pencere
 
         m_click = load_lgb(os.path.join(MODELS_DIR,"lgb_click.txt"))
         m_order = load_lgb(os.path.join(MODELS_DIR,"lgb_order.txt"))
@@ -1140,7 +1153,7 @@ def run_infer_blend(out_path: str, alpha: float, beta: float):
     set_seed(42)
     with timer("Blend infer"):
         test = load_test_sessions()
-        feats = assemble_timeaware_features(test, windows=(3,7,14,30,60))  # Daha fazla pencere
+        feats = assemble_timeaware_features(test, windows=(7,30))  # Daha fazla pencere
 
         # LTR
         m_click = load_lgb(os.path.join(MODELS_DIR,"lgb_click.txt"))
@@ -1180,7 +1193,7 @@ def run_infer_ensemble(out_path: str,
     w_ltr, w_xgb, w_cb, w_ta = ws.tolist()
 
     test = load_test_sessions()
-    feats_te = assemble_timeaware_features(test, windows=(3, 7, 14, 30, 60))  # Daha fazla pencere
+    feats_te = assemble_timeaware_features(test, windows=(7, 30))  # Daha fazla pencere
     feats_te = feats_te.sort_values(["session_id","ts_hour","content_id_hashed"]).reset_index(drop=True)
     key = ["session_id","content_id_hashed"]
 
@@ -1293,7 +1306,7 @@ def run_offline_eval(alpha_ltr: float, w_ltr: float, w_xgb: float, w_cb: float, 
                      metric: str = "ndcg", k: int = 100):
     print("[TIMER] Offline eval ...")
     train = load_train_sessions()
-    feats = assemble_timeaware_features(train, windows=(3, 7, 14, 30, 60))  # Daha fazla pencere
+    feats = assemble_timeaware_features(train, windows=(7, 30))  # Daha fazla pencere
     feats = _sort_for_grouping(feats)
     key = ["session_id","content_id_hashed"]
 
