@@ -153,17 +153,12 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
 
     con = duckdb.connect()
     try:
-        # Agresif bellek optimizasyonu - Kaggle 15GB limit
-        con.execute(f"PRAGMA threads={min(N_THREADS, 2)};")  # Daha az thread
-        con.execute(f"PRAGMA memory_limit='10GB';")  # Çok düşük bellek sınırı  
-        con.execute("PRAGMA temp_directory='/tmp';")  # Temp dosyaları disk kullan
-        con.execute("PRAGMA enable_optimizer=true;")
-        con.execute("PRAGMA force_parallelism=false;")  # Parallellik kapat
-        con.execute("PRAGMA max_temp_directory_size='2GB';")  # Çok küçük temp
-        con.execute("PRAGMA preserve_insertion_order=false;")  # Insertion order korunmasın
-        con.execute("PRAGMA enable_progress_bar=false;")  # Progress bar kapalı
-        con.execute("PRAGMA enable_profiling=false;")  # Profiling kapalı
-        con.execute("PRAGMA worker_threads=1;")  # Worker thread sayısını azalt
+        # Daha güvenli DuckDB ayarları (1.1.x ile uyumlu)
+        con.execute(f"PRAGMA threads={min(N_THREADS, 2)};")
+        con.execute(f"PRAGMA memory_limit='10GB';")
+        con.execute("PRAGMA temp_directory='/tmp';")
+        con.execute("PRAGMA preserve_insertion_order=false;")
+        con.execute("PRAGMA max_temp_directory_size='2GB';")
         print(f"[MEMORY] DuckDB configured with 10GB limit")
     except Exception as e:
         print(f"[MEMORY] DuckDB configuration warning: {e}")
@@ -558,11 +553,34 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         row_count = con.execute("SELECT COUNT(*) FROM sessions_df").fetchone()[0]
         print(f"[MEMORY] Processing {row_count:,} rows...")
         
-        if row_count > 200000:  # 200K'dan fazla satır varsa basitleştirilmiş query
+        # Önce çok büyük veri, sonra büyük veri
+        if row_count > 500_000:  # Very large dataset -> chunk
+            print(f"[MEMORY] Very large dataset, processing in chunks...")
+            
+            unique_users = con.execute("SELECT DISTINCT user_id_hashed FROM sessions_df ORDER BY user_id_hashed").df()['user_id_hashed'].tolist()
+            chunk_size = max(50, len(unique_users) // 8)  # En az 8 chunk
+            
+            chunks = []
+            for i in range(0, len(unique_users), chunk_size):
+                user_chunk = unique_users[i:i+chunk_size]
+                user_list = "', '".join(map(str, user_chunk))
+                
+                chunk_sql = sql + f" WHERE s.user_id_hashed IN ('{user_list}')"
+                chunk_df = con.execute(chunk_sql).df()
+                chunks.append(chunk_df)
+                
+                gc.collect()
+                print(f"[MEMORY] Processed chunk {len(chunks)}/{(len(unique_users) + chunk_size - 1) // chunk_size}")
+            
+            out = pd.concat(chunks, ignore_index=True)
+            del chunks
+            gc.collect()
+
+        elif row_count > 200_000:  # Large dataset -> simplified query
             print(f"[MEMORY] Large dataset detected, using simplified query...")
             check_memory_usage()
             
-            # Çok basitleştirilmiş SQL - sadece en kritik features
+            # Basitleştirilmiş SQL - mevcut view isimleriyle
             simplified_sql = f"""
                 WITH s AS (SELECT *, CAST(session_date AS DATE) AS sdate FROM sessions_df)
                 SELECT
@@ -586,63 +604,39 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
                 FROM s
                 LEFT JOIN LATERAL (
                     SELECT r.d, {', '.join(sel_sw)}
-                    FROM sitewide_roll r
+                    FROM sw_roll r
                     WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
                     ORDER BY r.d DESC LIMIT 1
                 ) AS swf ON TRUE
                 LEFT JOIN LATERAL (
                     SELECT r.d, {', '.join(sel_tt)}
-                    FROM termcontent_roll r
+                    FROM tt_roll r
                     WHERE r.content_id_hashed = s.content_id_hashed 
                       AND r.search_term_normalized = s.search_term_normalized 
                       AND r.d <= s.sdate
                     ORDER BY r.d DESC LIMIT 1
                 ) AS ttf ON TRUE
-                LEFT JOIN price_rating_features prrf ON prrf.content_id_hashed = s.content_id_hashed
+                LEFT JOIN LATERAL (
+                    SELECT r.d, r.selling_price, r.discounted_price, r.original_price, r.rate_avg
+                    FROM prr r 
+                    WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+                    ORDER BY r.d DESC LIMIT 1
+                ) AS prrf ON TRUE
             """
             out = con.execute(simplified_sql).df()
             check_memory_usage()
-            
-        elif row_count > 500000:  # 500K'dan fazla satır varsa chunk'lara böl
-            print(f"[MEMORY] Very large dataset, processing in chunks...")
-            
-            # User ID'lere göre chunk'lara böl
-            unique_users = con.execute("SELECT DISTINCT user_id_hashed FROM sessions_df ORDER BY user_id_hashed").df()['user_id_hashed'].tolist()
-            chunk_size = max(50, len(unique_users) // 8)  # En az 8 chunk
-            
-            chunks = []
-            for i in range(0, len(unique_users), chunk_size):
-                user_chunk = unique_users[i:i+chunk_size]
-                user_list = "', '".join(map(str, user_chunk))
-                
-                chunk_sql = sql + f" WHERE s.user_id_hashed IN ('{user_list}')"
-                chunk_df = con.execute(chunk_sql).df()
-                chunks.append(chunk_df)
-                
-                # Explicit garbage collection
-                import gc
-                gc.collect()
-                print(f"[MEMORY] Processed chunk {len(chunks)}/{(len(unique_users) + chunk_size - 1) // chunk_size}")
-            
-            # Chunk'ları birleştir
-            out = pd.concat(chunks, ignore_index=True)
-            del chunks  # Belleği temizle
-            import gc
-            gc.collect()
-            
         else:
             # Küçük dataset için normal işlem
             out = con.execute(sql).df()
             
     except Exception as e:
-        print(f"[MEMORY] Error in chunked processing: {e}, falling back to minimal features")
+        print(f"[MEMORY] Error in feature SQL: {e}, falling back to minimal features")
         
         # Minimal feature set - sadece en temel özellikler
         try:
             minimal_sql = """
                 WITH s AS (SELECT *, CAST(session_date AS DATE) AS sdate FROM sessions_df)
                 SELECT s.*,
-                       -- Sadece en temel features
                        COALESCE(prrf.rate_avg, 3.0) AS rating_avg,
                        LOG(1 + COALESCE(prrf.selling_price,100)) AS log_selling_price,
                        CASE
@@ -651,10 +645,15 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
                          ELSE 0.0
                        END AS discount_pct
                 FROM s
-                LEFT JOIN price_rating_features prrf ON prrf.content_id_hashed = s.content_id_hashed
+                LEFT JOIN LATERAL (
+                    SELECT r.d, r.selling_price, r.discounted_price, r.original_price, r.rate_avg
+                    FROM prr r 
+                    WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+                    ORDER BY r.d DESC LIMIT 1
+                ) AS prrf ON TRUE
             """
             out = con.execute(minimal_sql).df()
-            print("[MEMORY] Using minimal feature set due to memory constraints")
+            print("[MEMORY] Using minimal feature set due to memory/SQL constraints")
         except Exception as final_e:
             print(f"[MEMORY] Final fallback failed: {final_e}, returning basic session data")
             out = s.copy()  # En son çare olarak sadece session verisi
@@ -726,25 +725,10 @@ def add_in_session_features(df: pd.DataFrame) -> pd.DataFrame:
     sess_start = df.groupby("session_id")["ts_hour"].transform("min")
     df["secs_since_session_start"] = (df["ts_hour"] - sess_start).dt.total_seconds().astype("float32")
     
-    # mevcut liste: ["order_rate_7d","tc_ctr_7d","discount_pct","rating_avg"]
+    # Oturum-içi göreli rütbeler (doğru trend isimleri)
     for base in ["order_rate_7d","tc_ctr_7d","discount_pct","rating_avg",
-                 "log_discounted_price","trend_order_7v30","trend_tcctr_7v30"]:
-        if base in df.columns:
-            df[f"{base}_rank_sess"] = df.groupby("session_id")[base].rank(method="first", pct=True).astype("float32")
-        # ucuzluk ve indirim rütbeleri (oturum içi)
-        if "log_discounted_price" in df.columns:
-            df["cheap_rank_sess"] = 1.0 - df.groupby("session_id")["log_discounted_price"]\
-                .rank(method="first", pct=True)  # 1 = en ucuz
-
-        if "discount_pct" in df.columns:
-            df["discount_rank_sess"] = df.groupby("session_id")["discount_pct"]\
-                .rank(method="first", ascending=False, pct=True)  # 1 = en yüksek indirim
-
-    
-    # oturum-içi göreli rütbeler (global öncülleri oturum içinde normalize et)
-    for base in ["order_rate_7d","tc_ctr_7d","discount_pct","rating_avg",
-                 "log_discounted_price","trend_order_7v30","trend_tcctr_7v30",
-                 "user_term_ctr_30d","popularity_x_relevance_7d"]:  # Daha fazla feature
+                 "log_discounted_price","trend_order_rate_7v30","trend_tc_ctr_7v30",
+                 "user_term_ctr_30d","popularity_x_relevance_7d"]:
         if base in df.columns:
             df[f"{base}_rank_sess"] = df.groupby("session_id")[base].rank(method="first", pct=True).astype("float32")
 
@@ -757,25 +741,36 @@ def add_in_session_features(df: pd.DataFrame) -> pd.DataFrame:
         df["discount_rank_sess"] = df.groupby("session_id")["discount_pct"]\
             .rank(method="first", ascending=False, pct=True)  # 1 = en yüksek indirim
     
-    # Yeni oturum özellikleri
-    # Oturumdaki etkileşim yoğunluğu
-    sess_stats = df.groupby("session_id").agg({
-        "clicked": ["sum", "mean"],
-        "ordered": ["sum", "mean"],
-        "added_to_cart": ["sum", "mean"] if "added_to_cart" in df.columns else ["count"],
-        "sess_step_idx": "max"
-    }).fillna(0)
+    # Yeni oturum özellikleri (kolon varlığına göre sağlam)
+    agg_map = {"sess_step_idx": "max"}
+    if "clicked" in df.columns:
+        agg_map["clicked"] = ["sum", "mean"]
+    if "ordered" in df.columns:
+        agg_map["ordered"] = ["sum", "mean"]
+    if "added_to_cart" in df.columns:
+        agg_map["added_to_cart"] = ["sum", "mean"]
+
+    sess_stats = df.groupby("session_id").agg(agg_map).fillna(0)
+    # MultiIndex flatten
+    if isinstance(sess_stats.columns, pd.MultiIndex):
+        sess_stats.columns = [f"sess_{agg}_{col}" for col, agg in sess_stats.columns.to_list()]
+    else:
+        sess_stats.columns = [f"sess_{c}" for c in sess_stats.columns]
+    sess_stats = sess_stats.reset_index()
     
-    sess_stats.columns = [f"sess_{col[1]}_{col[0]}" for col in sess_stats.columns]
-    sess_stats = sess_stats.add_suffix("").reset_index()
-    
-    # Session stats'i merge et
-    df = df.merge(sess_stats[["session_id", "sess_sum_clicked", "sess_mean_clicked", 
-                             "sess_sum_ordered", "sess_mean_ordered", "sess_max_sess_step_idx"]], 
-                 on="session_id", how="left")
-    
+    # Session stats'i merge et (mevcut olanları getir)
+    df = df.merge(sess_stats, on="session_id", how="left")
+
+    # Beklenen ama olmayabilecek kolonları sıfırla
+    for c in ["sess_sum_clicked", "sess_mean_clicked", "sess_sum_ordered", "sess_mean_ordered"]:
+        if c not in df.columns:
+            df[c] = 0.0
+    if "sess_max_sess_step_idx" not in df.columns and "sess_step_idx" in df.columns:
+        # bazı durumlarda isim 'sess_max_sess_step_idx' olarak gelir; yoksa türet
+        df["sess_max_sess_step_idx"] = df.groupby("session_id")["sess_step_idx"].transform("max").astype("float32")
+
     # Oturum içi pozisyon etkileri
-    df["relative_position"] = df["sess_step_idx"] / (df["sess_max_sess_step_idx"] + 1)
+    df["relative_position"] = df["sess_step_idx"] / (df["sess_max_sess_step_idx"].fillna(0) + 1)
     df["position_decay"] = np.exp(-df["sess_step_idx"] / 10.0)  # Pozisyon azalma etkisi
 
     return df
@@ -1322,6 +1317,7 @@ def run_infer_ensemble(out_path: str,
         ltr = feats_te[key].copy()
         ltr["pred_click"] = predict_rank_lgb(feats_te, m_click)
         ltr["pred_order"] = predict_rank_lgb(feats_te, m_order)
+
         ltr["pred_ltr"] = (1.0 - alpha_ltr) * ltr["pred_click"] + alpha_ltr * ltr["pred_order"]
         ltr = normalize_in_session(ltr, "pred_ltr")[key+["pred_ltr"]]
     except Exception as e:
