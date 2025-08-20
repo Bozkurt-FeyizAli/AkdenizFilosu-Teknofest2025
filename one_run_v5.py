@@ -88,13 +88,6 @@ def _mk_roll(win: int, alias_prefix: str, col: str, part_cols: str) -> str:
     return (f"SUM({col}) OVER (PARTITION BY {part_cols} ORDER BY d "
             f"RANGE BETWEEN INTERVAL {win} DAY PRECEDING AND CURRENT ROW) "
             f"AS {alias_prefix}_{win}d")
-def _safe_get_column(df: pd.DataFrame, col_name: str, default_value: float = 0.0) -> pd.Series:
-    """DataFrame'den güvenli sütun erişimi - yoksa default_value ile Series döner"""
-    if col_name in df.columns:
-        return df[col_name].fillna(default_value)
-    else:
-        return pd.Series(default_value, index=df.index, dtype='float64')
-
 
 def assemble_timeaware_features(sessions: pd.DataFrame, windows=(3,7,14,30,60)) -> pd.DataFrame:
     print("[TA] DuckDB builder -> start")
@@ -106,66 +99,420 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(3,7,14,30,60)) 
     s["ts_hour"] = pd.to_datetime(s["ts_hour"], utc=False)
     s["session_date"] = s["ts_hour"].dt.floor("D")
 
-    # Basit fallback: eğer memory/DuckDB sorunları varsa sadece temel feature'ları döndür
+    con = duckdb.connect()
     try:
-        con = duckdb.connect()
-        try:
-            n = max(1, min(os.cpu_count() or 4, 16))
-            con.execute(f"PRAGMA threads={n};")
-        except Exception:
-            pass
-        con.register("sessions_df", s)
+        n = max(1, min(os.cpu_count() or 4, 16))
+        con.execute(f"PRAGMA threads={n};")
+    except Exception:
+        pass
+    con.register("sessions_df", s)
 
-        # Burada gerçek DuckDB SQL'leri gelir...
-        # Eğer herhangi bir hata olursa aşağıdaki except bloğuna düşer
-        
-        # Şimdilik basit bir test yapalım
-        test_result = con.execute("SELECT COUNT(*) FROM sessions_df").fetchone()
-        print(f"[TA] DuckDB test successful: {test_result[0]} rows")
-        
-        # Gerçek feature engineering burada olacak
-        # Şimdilik sadece giriş verilerini döndürelim
-        out = s.copy()
-        
-        # Temel trend feature'ları ekle
-        for col in ["tc_ctr_7d", "tc_ctr_14d", "tc_ctr_30d", "order_rate_7d", "order_rate_14d", "order_rate_30d"]:
-            if col not in out.columns:
-                out[col] = 0.0
-        
-        # Yeni feature'lar için placeholder
-        for col in ["discount_pct", "rating_avg", "user_term_ctr_30d", 
-                   "user_content_fashion_order_rate_30d", "content_search_ctr_7d"]:
-            if col not in out.columns:
-                out[col] = 0.0
-                
-    except Exception as e:
-        print(f"[TA] DuckDB error: {e}, falling back to basic features")
-        out = s.copy()
-        
-        # Minimum feature set
-        basic_features = ["tc_ctr_7d", "tc_ctr_14d", "tc_ctr_30d", "order_rate_7d", 
-                         "order_rate_14d", "order_rate_30d", "discount_pct", "rating_avg",
-                         "user_term_ctr_30d", "user_content_fashion_order_rate_30d", 
-                         "content_search_ctr_7d"]
-        
-        for feat in basic_features:
-            if feat not in out.columns:
-                out[feat] = np.random.random(len(out)) * 0.1  # Küçük random değerler
-    
-    # In-session feature'ları ekle
-    try:
-        out = add_in_session_features(out) 
-    except Exception as e:
-        print(f"[TA] In-session features error: {e}")
-        # Temel in-session feature'lar
-        if "sess_step_idx" not in out.columns:
-            out["sess_step_idx"] = out.groupby("session_id").cumcount().astype("int32")
-        if "seen_before" not in out.columns:
-            out["seen_before"] = 0
+    # sınırlar ve anahtarlar
+    min_d, max_d = con.execute("SELECT MIN(session_date)::DATE, MAX(session_date)::DATE FROM sessions_df").fetchone()
+    con.execute(f"CREATE OR REPLACE TEMP VIEW sess_bounds AS SELECT DATE '{min_d}' AS min_d, DATE '{max_d}' AS max_d")
+    con.execute("CREATE OR REPLACE TEMP VIEW key_c AS SELECT DISTINCT content_id_hashed FROM sessions_df")
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW key_ct AS
+        SELECT DISTINCT content_id_hashed, search_term_normalized FROM sessions_df
+    """)
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW key_ut AS
+        SELECT DISTINCT user_id_hashed, search_term_normalized
+        FROM sessions_df WHERE user_id_hashed IS NOT NULL AND search_term_normalized IS NOT NULL
+    """)
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW key_uc AS
+        SELECT DISTINCT user_id_hashed, content_id_hashed
+        FROM sessions_df WHERE user_id_hashed IS NOT NULL AND content_id_hashed IS NOT NULL
+    """)
+    con.execute("CREATE OR REPLACE TEMP VIEW key_u AS SELECT DISTINCT user_id_hashed FROM sessions_df WHERE user_id_hashed IS NOT NULL")
 
-    # Trend sinyalleri
-    out["trend_order_rate_7v30"] = _safe_get_column(out, "order_rate_7d") - _safe_get_column(out, "order_rate_30d")
-    out["trend_tc_ctr_7v30"] = _safe_get_column(out, "tc_ctr_7d") - _safe_get_column(out, "tc_ctr_30d")
+    # sitewide rolling (content)
+    sw_roll_exprs=[]
+    for w in windows:
+        sw_roll_exprs += [_mk_roll(w,"click","total_click","content_id_hashed"),
+                          _mk_roll(w,"order","total_order","content_id_hashed")]
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW sw_roll AS
+        WITH sw AS (
+            SELECT sw.content_id_hashed, CAST(sw.date AS DATE) AS d,
+                   CAST(sw.total_click AS DOUBLE) AS total_click,
+                   CAST(sw.total_order AS DOUBLE) AS total_order
+            FROM read_parquet('{DATA_DIR}/content/sitewide_log.parquet') sw
+            JOIN key_c USING (content_id_hashed)
+            WHERE CAST(sw.date AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT content_id_hashed, d, {", ".join(sw_roll_exprs)}
+        FROM sw ORDER BY content_id_hashed, d
+    """)
+
+    # term×content rolling
+    tt_roll_exprs=[]
+    for w in windows:
+        tt_roll_exprs += [_mk_roll(w,"imp","total_search_impression","content_id_hashed, search_term_normalized"),
+                          _mk_roll(w,"clk","total_search_click","content_id_hashed, search_term_normalized")]
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW tt_roll AS
+        WITH ctt AS (
+            SELECT c.content_id_hashed, c.search_term_normalized,
+                   CAST(c.date AS DATE) AS d,
+                   CAST(c.total_search_impression AS DOUBLE) AS total_search_impression,
+                   CAST(c.total_search_click AS DOUBLE) AS total_search_click
+            FROM read_parquet('{DATA_DIR}/content/top_terms_log.parquet') c
+            JOIN key_ct k
+              ON k.content_id_hashed=c.content_id_hashed AND k.search_term_normalized=c.search_term_normalized
+            WHERE CAST(c.date AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT content_id_hashed, search_term_normalized, d, {", ".join(tt_roll_exprs)}
+        FROM ctt ORDER BY content_id_hashed, search_term_normalized, d
+    """)
+
+    # price / rating son değer
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW prr AS
+        SELECT p.content_id_hashed, CAST(p.update_date AS DATE) AS d,
+               CAST(p.original_price AS DOUBLE) AS original_price,
+               CAST(p.selling_price AS DOUBLE) AS selling_price,
+               CAST(p.discounted_price AS DOUBLE) AS discounted_price,
+               CAST(p.content_rate_avg AS DOUBLE) AS rate_avg,
+               CAST(p.content_rate_count AS DOUBLE) AS rate_cnt
+        FROM read_parquet('{DATA_DIR}/content/price_rate_review_data.parquet') p
+        JOIN key_c USING (content_id_hashed)
+        WHERE CAST(p.update_date AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+    """)
+
+    # user×term 30g
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW ut_roll AS
+        WITH ut AS (
+            SELECT u.user_id_hashed, u.search_term_normalized,
+                   CAST(u.ts_hour AS DATE) AS d,
+                   CAST(u.total_search_impression AS DOUBLE) AS imp,
+                   CAST(u.total_search_click AS DOUBLE) AS clk
+            FROM read_parquet('{DATA_DIR}/user/top_terms_log.parquet') u
+            JOIN key_ut k ON k.user_id_hashed=u.user_id_hashed AND k.search_term_normalized=u.search_term_normalized
+            WHERE CAST(u.ts_hour AS DATE) BETWEEN
+                (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT user_id_hashed, search_term_normalized, d,
+               SUM(imp) OVER (PARTITION BY user_id_hashed, search_term_normalized
+                              ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS u_imp_30d,
+               SUM(clk) OVER (PARTITION BY user_id_hashed, search_term_normalized
+                              ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS u_clk_30d
+        FROM ut ORDER BY user_id_hashed, search_term_normalized, d
+    """)
+
+    # NEW: user sitewide rolling (click/cart/fav/order)
+    u_sw_exprs = []
+    for w in windows:
+        u_sw_exprs += [
+            _mk_roll(w, f"u_sw_click", "total_click", "user_id_hashed"),
+            _mk_roll(w, f"u_sw_cart",  "total_cart",  "user_id_hashed"),
+            _mk_roll(w, f"u_sw_fav",   "total_fav",   "user_id_hashed"),
+            _mk_roll(w, f"u_sw_order", "total_order", "user_id_hashed"),
+        ]
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW u_sw_roll AS
+        WITH u AS (
+            SELECT user_id_hashed, CAST(ts_hour AS DATE) AS d,
+                   CAST(total_click AS DOUBLE) AS total_click,
+                   CAST(total_cart  AS DOUBLE) AS total_cart,
+                   CAST(total_fav   AS DOUBLE) AS total_fav,
+                   CAST(total_order AS DOUBLE) AS total_order
+            FROM read_parquet('{DATA_DIR}/user/sitewide_log.parquet')
+            JOIN key_u USING (user_id_hashed)
+            WHERE CAST(ts_hour AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT user_id_hashed, d, {", ".join(u_sw_exprs)}
+        FROM u ORDER BY user_id_hashed, d
+    """)
+
+    # NEW: user search rolling (impression/click)
+    u_search_exprs = []
+    for w in windows:
+        u_search_exprs += [
+            _mk_roll(w, f"u_search_imp", "total_search_impression", "user_id_hashed"),
+            _mk_roll(w, f"u_search_clk", "total_search_click",      "user_id_hashed"),
+        ]
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW u_search_roll AS
+        WITH u AS (
+            SELECT user_id_hashed, CAST(ts_hour AS DATE) AS d,
+                   CAST(total_search_impression AS DOUBLE) AS total_search_impression,
+                   CAST(total_search_click      AS DOUBLE) AS total_search_click
+            FROM read_parquet('{DATA_DIR}/user/search_log.parquet')
+            JOIN key_u USING (user_id_hashed)
+            WHERE CAST(ts_hour AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT user_id_hashed, d, {", ".join(u_search_exprs)}
+        FROM u ORDER BY user_id_hashed, d
+    """)
+
+    # NEW: content search rolling (impression/click)
+    c_search_exprs = []
+    for w in windows:
+        c_search_exprs += [
+            _mk_roll(w, f"c_search_imp", "total_search_impression", "content_id_hashed"),
+            _mk_roll(w, f"c_search_clk", "total_search_click",      "content_id_hashed"),
+        ]
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW c_search_roll AS
+        WITH c AS (
+            SELECT content_id_hashed, CAST(date AS DATE) AS d,
+                   CAST(total_search_impression AS DOUBLE) AS total_search_impression,
+                   CAST(total_search_click      AS DOUBLE) AS total_search_click
+            FROM read_parquet('{DATA_DIR}/content/search_log.parquet')
+            JOIN key_c USING (content_id_hashed)
+            WHERE CAST(date AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT content_id_hashed, d, {", ".join(c_search_exprs)}
+        FROM c ORDER BY content_id_hashed, d
+    """)
+
+    # NEW: term-only rolling
+    t_search_exprs = []
+    for w in windows:
+        t_search_exprs += [
+            _mk_roll(w, f"t_imp", "total_search_impression", "search_term_normalized"),
+            _mk_roll(w, f"t_clk", "total_search_click",      "search_term_normalized"),
+        ]
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW t_search_roll AS
+        WITH t AS (
+            SELECT search_term_normalized, CAST(ts_hour AS DATE) AS d,
+                   CAST(total_search_impression AS DOUBLE) AS total_search_impression,
+                   CAST(total_search_click      AS DOUBLE) AS total_search_click
+            FROM read_parquet('{DATA_DIR}/term/search_log.parquet')
+            WHERE CAST(ts_hour AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT search_term_normalized, d, {", ".join(t_search_exprs)}
+        FROM t ORDER BY search_term_normalized, d
+    """)
+
+    # NEW: user×content fashion logs (search)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW uf_roll AS
+        WITH uf AS (
+            SELECT user_id_hashed, content_id_hashed,
+                   CAST(ts_hour AS DATE) AS d,
+                   CAST(total_search_impression AS DOUBLE) AS imp,
+                   CAST(total_search_click AS DOUBLE) AS clk
+            FROM read_parquet('{DATA_DIR}/user/fashion_search_log.parquet')
+            JOIN key_uc USING (user_id_hashed, content_id_hashed)
+            WHERE CAST(ts_hour AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT user_id_hashed, content_id_hashed, d,
+               SUM(imp) OVER (PARTITION BY user_id_hashed, content_id_hashed
+                              ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS uf_imp_30d,
+               SUM(clk) OVER (PARTITION BY user_id_hashed, content_id_hashed
+                              ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS uf_clk_30d
+        FROM uf ORDER BY user_id_hashed, content_id_hashed, d
+    """)
+
+    # NEW: user×content fashion sitewide logs (click/cart/fav/order)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW ufs_roll AS
+        WITH ufs AS (
+            SELECT user_id_hashed, content_id_hashed,
+                   CAST(ts_hour AS DATE) AS d,
+                   CAST(total_click AS DOUBLE) AS total_click,
+                   CAST(total_cart  AS DOUBLE) AS total_cart,
+                   CAST(total_fav   AS DOUBLE) AS total_fav,
+                   CAST(total_order AS DOUBLE) AS total_order
+            FROM read_parquet('{DATA_DIR}/user/fashion_sitewide_log.parquet')
+            JOIN key_uc USING (user_id_hashed, content_id_hashed)
+            WHERE CAST(ts_hour AS DATE) BETWEEN
+              (SELECT min_d - INTERVAL 90 DAY FROM sess_bounds) AND (SELECT max_d FROM sess_bounds)
+        )
+        SELECT user_id_hashed, content_id_hashed, d,
+               SUM(total_click) OVER (PARTITION BY user_id_hashed, content_id_hashed
+                                      ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS uf_sw_click_30d,
+               SUM(total_cart)  OVER (PARTITION BY user_id_hashed, content_id_hashed
+                                      ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS uf_sw_cart_30d,
+               SUM(total_fav)   OVER (PARTITION BY user_id_hashed, content_id_hashed
+                                      ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS uf_sw_fav_30d,
+               SUM(total_order) OVER (PARTITION BY user_id_hashed, content_id_hashed
+                                      ORDER BY d RANGE BETWEEN INTERVAL 30 DAY PRECEDING AND CURRENT ROW) AS uf_sw_order_30d
+        FROM ufs ORDER BY user_id_hashed, content_id_hashed, d
+    """)
+
+    # meta: genişletilmiş
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW meta AS
+        SELECT content_id_hashed,
+               CAST(content_creation_date AS DATE) AS creation_date,
+               CAST(attribute_type_count AS DOUBLE) AS attr_type_cnt,
+               CAST(total_attribute_option_count AS DOUBLE) AS attr_opt_cnt,
+               CAST(merchant_count AS DOUBLE) AS merchant_cnt,
+               CAST(filterable_label_count AS DOUBLE) AS filter_label_cnt
+        FROM read_parquet('{DATA_DIR}/content/metadata.parquet')
+    """)
+
+    # user metadata (numerik)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW user_meta AS
+        SELECT user_id_hashed,
+               CASE WHEN lower(user_gender)='female' THEN 1
+                    WHEN lower(user_gender)='male' THEN 2
+                    ELSE 0 END AS user_gender_code,
+               CAST(user_birth_year AS DOUBLE) AS user_birth_year,
+               CAST(user_tenure_in_days AS DOUBLE) AS user_tenure_days
+        FROM read_parquet('{DATA_DIR}/user/metadata.parquet')
+    """)
+
+    # as-of join + oranlar
+    rate_cols, ctr_cols, sel_sw, sel_tt = [], [], [], []
+    for w in windows:
+        sel_sw += [f"r.click_{w}d AS click_{w}d", f"r.order_{w}d AS order_{w}d"]
+        sel_tt += [f"r.imp_{w}d AS imp_{w}d", f"r.clk_{w}d AS clk_{w}d"]
+        rate_cols += [
+            f"(COALESCE(swf.click_{w}d,0)+1.0)/(COALESCE(swf.click_{w}d,0)+1.0+3.0) AS click_rate_{w}d",
+            f"(COALESCE(swf.order_{w}d,0)+1.0)/(COALESCE(swf.click_{w}d,0)+1.0+3.0) AS order_rate_{w}d",
+        ]
+        ctr_cols += [
+            f"(COALESCE(ttf.clk_{w}d,0)+1.0)/(COALESCE(ttf.imp_{w}d,0)+1.0+3.0) AS tc_ctr_{w}d",
+        ]
+
+    sql = f"""
+        WITH s AS (SELECT *, CAST(session_date AS DATE) AS sdate FROM sessions_df)
+        SELECT
+            s.*,
+            {", ".join(rate_cols)},
+            {", ".join(ctr_cols)},
+            CASE
+              WHEN prrf.original_price IS NOT NULL AND prrf.original_price > 0
+              THEN (prrf.original_price - COALESCE(prrf.discounted_price, prrf.selling_price)) / prrf.original_price
+              ELSE NULL
+            END AS discount_pct,
+            prrf.rate_avg AS rating_avg,
+            LOG(1 + COALESCE(prrf.selling_price,0)) AS log_selling_price,
+            LOG(1 + COALESCE(prrf.discounted_price,0)) AS log_discounted_price,
+            LOG(1 + COALESCE(prrf.rate_cnt,0)) AS rating_log_cnt,
+            (COALESCE(utf.u_clk_30d,0)+1.0)/(COALESCE(utf.u_imp_30d,0)+1.0+3.0) AS user_term_ctr_30d,
+            -- NEW: user sitewide rates
+            {', '.join([f"(COALESCE(uswf.u_sw_cart_{w}d,0)+1.0)/(COALESCE(uswf.u_sw_click_{w}d,0)+1.0+3.0) AS user_sw_cart_rate_{w}d" for w in windows])},
+            {', '.join([f"(COALESCE(uswf.u_sw_fav_{w}d,0)+1.0)/(COALESCE(uswf.u_sw_click_{w}d,0)+1.0+3.0) AS user_sw_fav_rate_{w}d" for w in windows])},
+            {', '.join([f"(COALESCE(uswf.u_sw_order_{w}d,0)+1.0)/(COALESCE(uswf.u_sw_click_{w}d,0)+1.0+3.0) AS user_sw_order_rate_{w}d" for w in windows])},
+            -- NEW: user search ctr
+            {', '.join([f"(COALESCE(usrf.u_search_clk_{w}d,0)+1.0)/(COALESCE(usrf.u_search_imp_{w}d,0)+1.0+3.0) AS user_search_ctr_{w}d" for w in windows])},
+            -- NEW: content search ctr
+            {', '.join([f"(COALESCE(csr.c_search_clk_{w}d,0)+1.0)/(COALESCE(csr.c_search_imp_{w}d,0)+1.0+3.0) AS content_search_ctr_{w}d" for w in windows])},
+            -- NEW: term ctr
+            {', '.join([f"(COALESCE(tsr.t_clk_{w}d,0)+1.0)/(COALESCE(tsr.t_imp_{w}d,0)+1.0+3.0) AS term_ctr_{w}d" for w in windows])},
+            -- NEW: user×content fashion ctr/order-rate 30d
+            (COALESCE(ufr.uf_clk_30d,0)+1.0)/(COALESCE(ufr.uf_imp_30d,0)+1.0+3.0) AS user_content_fashion_ctr_30d,
+            (COALESCE(ufsr.uf_sw_order_30d,0)+1.0)/(COALESCE(ufsr.uf_sw_click_30d,0)+1.0+3.0) AS user_content_fashion_order_rate_30d,
+            COALESCE(DATEDIFF('day', m.creation_date, s.sdate), -1) AS days_since_creation,
+            m.attr_type_cnt, m.attr_opt_cnt, m.merchant_cnt, m.filter_label_cnt,
+            um.user_gender_code, um.user_birth_year, um.user_tenure_days
+        FROM s
+        LEFT JOIN LATERAL (
+            SELECT r.d, {', '.join(sel_sw)} FROM sw_roll r
+            WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS swf ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d, {', '.join(sel_tt)} FROM tt_roll r
+            WHERE r.content_id_hashed = s.content_id_hashed
+              AND r.search_term_normalized = s.search_term_normalized
+              AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS ttf ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d, r.selling_price, r.discounted_price, r.original_price, r.rate_avg, r.rate_cnt
+            FROM prr r WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS prrf ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d, r.u_imp_30d, r.u_clk_30d
+            FROM ut_roll r
+            WHERE r.user_id_hashed = s.user_id_hashed
+              AND r.search_term_normalized = s.search_term_normalized
+              AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS utf ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d,
+                   {', '.join([f'r.u_sw_click_{w}d AS u_sw_click_{w}d' for w in windows])},
+                   {', '.join([f'r.u_sw_cart_{w}d  AS u_sw_cart_{w}d'  for w in windows])},
+                   {', '.join([f'r.u_sw_fav_{w}d   AS u_sw_fav_{w}d'   for w in windows])},
+                   {', '.join([f'r.u_sw_order_{w}d AS u_sw_order_{w}d' for w in windows])}
+            FROM u_sw_roll r
+            WHERE r.user_id_hashed = s.user_id_hashed AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS uswf ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d,
+                   {', '.join([f'r.u_search_imp_{w}d AS u_search_imp_{w}d' for w in windows])},
+                   {', '.join([f'r.u_search_clk_{w}d AS u_search_clk_{w}d' for w in windows])}
+            FROM u_search_roll r
+            WHERE r.user_id_hashed = s.user_id_hashed AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS usrf ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d,
+                   {', '.join([f'r.c_search_imp_{w}d AS c_search_imp_{w}d' for w in windows])},
+                   {', '.join([f'r.c_search_clk_{w}d AS c_search_clk_{w}d' for w in windows])}
+            FROM c_search_roll r
+            WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS csr ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d,
+                   {', '.join([f'r.t_imp_{w}d AS t_imp_{w}d' for w in windows])},
+                   {', '.join([f'r.t_clk_{w}d AS t_clk_{w}d' for w in windows])}
+            FROM t_search_roll r
+            WHERE r.search_term_normalized = s.search_term_normalized AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS tsr ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d, r.uf_imp_30d, r.uf_clk_30d
+            FROM uf_roll r
+            WHERE r.user_id_hashed = s.user_id_hashed AND r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS ufr ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT r.d, r.uf_sw_click_30d, r.uf_sw_cart_30d, r.uf_sw_fav_30d, r.uf_sw_order_30d
+            FROM ufs_roll r
+            WHERE r.user_id_hashed = s.user_id_hashed AND r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+            ORDER BY r.d DESC LIMIT 1
+        ) AS ufsr ON TRUE
+        LEFT JOIN meta m ON m.content_id_hashed = s.content_id_hashed
+        LEFT JOIN user_meta um ON um.user_id_hashed = s.user_id_hashed
+    """
+    out = con.execute(sql).df()
+    drop_cols = [c for c in out.columns if c in {"sdate"} or c.endswith(".d") or c.endswith("_d")]
+    out = out.drop(columns=list(set(drop_cols)), errors="ignore")
+
+    # >>> OTURUM-İÇİ SİNYALLERİ BURADA EKLE <<<
+    out = add_in_session_features(out) 
+    # 7g - 30g trend sinyalleri
+    out["trend_order_rate_7v30"] = out.get("order_rate_7d", 0).fillna(0) - out.get("order_rate_30d", 0).fillna(0)
+    out["trend_tc_ctr_7v30"]     = out.get("tc_ctr_7d", 0).fillna(0)       - out.get("tc_ctr_30d", 0).fillna(0)
+
+    # --- NEW: trend & interaction features ---
+    # Güvenli oranlar (0 bölme yok)
+    eps = 1e-4
+    for a, b, name in [
+        ("order_rate_7d", "order_rate_30d", "trend_order_7v30"),
+        ("tc_ctr_7d",     "tc_ctr_30d",     "trend_tcctr_7v30"),
+        ("click_7d",      "click_30d",      "trend_swclick_7v30"),   # sitewide click sayıları varsa
+        ("order_7d",      "order_30d",      "trend_sworder_7v30"),   # sitewide order sayıları varsa
+    ]:
+        if a in out.columns and b in out.columns:
+            out[name] = (out[a].fillna(0) + eps) / (out[b].fillna(0) + eps)
+
+    # Promosyon x Kalite sinyali
+    if "discount_pct" in out.columns and "rating_avg" in out.columns:
+        out["promo_x_rating"] = out["discount_pct"].clip(lower=0).fillna(0) * (out["rating_avg"].fillna(0) / 5.0)
 
     out = reduce_memory_df(out)
     print("[TA] DuckDB builder -> done")
@@ -233,47 +580,36 @@ def add_in_session_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------- basit TA baseline ----------------------
 def score_timeaware_baseline(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["pred_click"] = 0.60*out.get("tc_ctr_7d", pd.Series(0, index=out.index)) + 0.25*out.get("tc_ctr_30d", pd.Series(0, index=out.index)) + 0.15*out.get("tc_ctr_14d", pd.Series(0, index=out.index))
-    out["pred_order"] = 0.65*out.get("order_rate_7d", pd.Series(0, index=out.index)) + 0.20*out.get("order_rate_30d", pd.Series(0, index=out.index)) + 0.15*out.get("order_rate_14d", pd.Series(0, index=out.index))
-    
-    # Güvenli sütun erişimi
-    discount_pct = out.get("discount_pct", pd.Series(0.0, index=out.index))
-    if isinstance(discount_pct, (int, float)):
-        discount_pct = pd.Series(discount_pct, index=out.index)
-    
-    rating_avg = out.get("rating_avg", pd.Series(0.0, index=out.index))
-    if isinstance(rating_avg, (int, float)):
-        rating_avg = pd.Series(rating_avg, index=out.index)
-    
-    user_term_ctr = out.get("user_term_ctr_30d", pd.Series(0.0, index=out.index))
-    if isinstance(user_term_ctr, (int, float)):
-        user_term_ctr = pd.Series(user_term_ctr, index=out.index)
-    
-    # Yeni feature'lar için güvenli erişim
-    user_content_fashion_order_rate = out.get("user_content_fashion_order_rate_30d", pd.Series(0.0, index=out.index))
-    if isinstance(user_content_fashion_order_rate, (int, float)):
-        user_content_fashion_order_rate = pd.Series(user_content_fashion_order_rate, index=out.index)
-    
-    content_search_ctr = out.get("content_search_ctr_7d", pd.Series(0.0, index=out.index))
-    if isinstance(content_search_ctr, (int, float)):
-        content_search_ctr = pd.Series(content_search_ctr, index=out.index)
-    
-    out["pred_order"] += 0.08*discount_pct.clip(lower=0).fillna(0)
-    out["pred_order"] += 0.04*(rating_avg.fillna(0)/5.0)
-    out["pred_click"] += 0.05*user_term_ctr.fillna(0)
-    
+    out["pred_click"] = 0.60*out.get("tc_ctr_7d", 0) + 0.25*out.get("tc_ctr_30d", 0) + 0.15*out.get("tc_ctr_14d", 0)
+    out["pred_order"] = 0.65*out.get("order_rate_7d", 0) + 0.20*out.get("order_rate_30d", 0) + 0.15*out.get("order_rate_14d", 0)
+    out["pred_order"] += 0.08*out.get("discount_pct", 0).clip(lower=0)
+    out["pred_order"] += 0.04*out.get("rating_avg", 0).fillna(0)/5.0
+    out["pred_click"] += 0.05*out.get("user_term_ctr_30d", 0)
     # Yeni feature'lar
-    out["pred_order"] += 0.03*user_content_fashion_order_rate.fillna(0)
-    out["pred_click"] += 0.02*content_search_ctr.fillna(0)
-    
+    out["pred_order"] += 0.03*out.get("user_content_fashion_order_rate_30d", 0)
+    out["pred_click"] += 0.02*out.get("content_search_ctr_7d", 0)
     out["pred_final"] = 0.85*out["pred_order"] + 0.15*out["pred_click"]
+    out["pred_final"] += 0.02*out.get("trend_order_7v30", 1.0).fillna(1.0)
+    out["pred_final"] += 0.02*out.get("order_rate_7d_rank_sess", 0.5).fillna(0.5)
     return out
+
 
 def normalize_in_session(df: pd.DataFrame, score_col="pred_final") -> pd.DataFrame:
     out = df.copy()
     grp = out.groupby("session_id")[score_col]
     out[score_col] = (out[score_col] - grp.transform("min")) / (grp.transform("max") - grp.transform("min") + 1e-8)
     return out
+
+def normalize_in_session_softmax(df: pd.DataFrame, score_col="pred_final", temperature: float = 1.0) -> pd.DataFrame:
+    out = df.copy()
+    def _softmax(x):
+        x = x.astype("float64") / max(temperature, 1e-6)
+        x = x - x.max()
+        ex = np.exp(x)
+        return (ex / (ex.sum() + 1e-12)).astype("float32")
+    out[score_col] = out.groupby("session_id")[score_col].transform(_softmax)
+    return out
+
 
 
 # ---------------------- yardımcılar: feature list / split ----------------------
@@ -313,6 +649,9 @@ def _group_counts(df: pd.DataFrame) -> np.ndarray:
     return df.groupby("session_id").size().astype(int).values
 
 def train_ltr_models(tr: pd.DataFrame, va: pd.DataFrame, feat_cols: list):
+    tr = tr.sort_values(["session_id","ts_hour","content_id_hashed"])
+    va = va.sort_values(["session_id","ts_hour","content_id_hashed"])
+
     # click
     dtr = lgb.Dataset(tr[feat_cols], label=tr["clicked"].astype(int), group=_group_counts(tr))
     dva = lgb.Dataset(va[feat_cols], label=va["clicked"].astype(int), group=_group_counts(va))
@@ -655,7 +994,10 @@ def run_train_ltr(alpha: float):
         feats = assemble_timeaware_features(train, windows=(3,7,14,30,60))
         feat_cols = _feature_cols(feats)
         tr, va = split_time_holdout(feats, holdout_days=7)
+        tr = _sort_for_grouping(tr)
+        va = _sort_for_grouping(va)
         m_click, m_order = train_ltr_models(tr, va, feat_cols)
+
 
         # hızlı alpha taraması (log amaçlı)
         for a in [0.70,0.74,0.78,0.80,0.82,0.85]:
@@ -685,7 +1027,8 @@ def run_infer_ltr(out_path: str, alpha: float):
         df["pred_click"] = predict_rank_lgb(df, m_click)
         df["pred_order"] = predict_rank_lgb(df, m_order)
         df["pred_final"] = (1-alpha)*df["pred_click"] + alpha*df["pred_order"]
-        df = normalize_in_session(df, "pred_final")
+        df = normalize_in_session_softmax(df, "pred_final", temperature=0.9)
+
 
         idx = load_sample_submission_session_ids()
         make_submission(df[["session_id","content_id_hashed","pred_final"]],
@@ -715,6 +1058,7 @@ def run_infer_blend(out_path: str, alpha: float, beta: float):
         # blend
         df = ltr.merge(ta, on=["session_id","content_id_hashed"], how="inner")
         df["pred_final"] = (1-beta)*df["pred_ltr"] + beta*df["pred_ta"]
+        df = normalize_in_session_softmax(df, "pred_final", temperature=0.9)
 
         idx = load_sample_submission_session_ids()
         make_submission(df[["session_id","content_id_hashed","pred_final"]],
@@ -827,18 +1171,17 @@ def run_infer_ensemble(out_path: str,
     df = df.merge(feats_te[sel_cols], on=key, how="left")
 
     df["repeat_bonus"] = (
-        0.02 * df["seen_before"].fillna(0) +
-        0.04 * (df["clicked_before_item_sess"].fillna(0) > 0).astype("float32") +
-        0.08 * (df["added_to_cart_before_item_sess"].fillna(0) > 0).astype("float32") +
-        0.05 * (df["added_to_fav_before_item_sess"].fillna(0) > 0).astype("float32")
+    0.03 * df["seen_before"].fillna(0) +
+    0.05 * (df["clicked_before_item_sess"].fillna(0) > 0).astype("float32") +
+    0.10 * (df["added_to_cart_before_item_sess"].fillna(0) > 0).astype("float32") +
+    0.06 * (df["added_to_fav_before_item_sess"].fillna(0) > 0).astype("float32")
     ).astype("float32")
+
 
     df["pred_final"] = (df["pred_final"] + df["repeat_bonus"]).astype("float32")
 
-    df = normalize_in_session(df, "pred_final")  # hafif min-max, opsiyonel
+    df = normalize_in_session_softmax(df, "pred_final", temperature=0.85)
 
-
-    df = normalize_in_session(df, "pred_final")
     idx = load_sample_submission_session_ids(os.path.join(DATA_DIR, "sample_submission.csv"))
     make_submission(df, out_path, session_index=idx)
     print(f"[TIMER] Ensemble infer done (w_ltr={w_ltr:.2f}, w_xgb={w_xgb:.2f}, w_cb={w_cb:.2f}, w_ta={w_ta:.2f})")
