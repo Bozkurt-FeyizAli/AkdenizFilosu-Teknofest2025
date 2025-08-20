@@ -64,6 +64,35 @@ class timer:
 def set_seed(s=42):
     np.random.seed(s)
 
+def check_memory_usage():
+    """Bellek kullanımını kontrol et ve log yaz"""
+    try:
+        # psutil varsa kullan
+        import psutil
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        memory_pct = process.memory_percent()
+        print(f"[MEMORY] Current usage: {memory_mb:.1f} MB ({memory_pct:.1f}%)")
+        
+        # Yüksek bellek kullanımında garbage collection
+        if memory_pct > 75:
+            print("[MEMORY] High memory usage detected, forcing garbage collection...")
+            gc.collect()
+            
+        return memory_mb, memory_pct
+    except ImportError:
+        # psutil yoksa sadece garbage collection yap
+        print("[MEMORY] Monitoring available (psutil not installed)")
+        gc.collect()
+        return 0, 0
+    except Exception:
+        return 0, 0
+
+def free_memory():
+    """Belleği temizle"""
+    gc.collect()
+    print("[MEMORY] Garbage collection completed")
+
 def reduce_memory_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         t = df[c].dtype
@@ -110,6 +139,10 @@ def _mk_roll(win: int, alias_prefix: str, col: str, part_cols: str) -> str:
 
 def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.DataFrame:
     print("[TA] DuckDB builder -> start")
+    
+    # Bellek kontrolü
+    check_memory_usage()
+    
     need = [c for c in [
         "ts_hour","search_term_normalized","content_id_hashed","session_id",
         "clicked","ordered","added_to_cart","added_to_fav","user_id_hashed"
@@ -120,15 +153,20 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
 
     con = duckdb.connect()
     try:
-        # Bellek optimizasyonu - RAM kullanımını sınırla
-        con.execute(f"PRAGMA threads={min(N_THREADS, 4)};")  # Thread sayısını sınırla
-        con.execute(f"PRAGMA memory_limit='16GB';")  # Bellek sınırını düşür
+        # Agresif bellek optimizasyonu - Kaggle 15GB limit
+        con.execute(f"PRAGMA threads={min(N_THREADS, 2)};")  # Daha az thread
+        con.execute(f"PRAGMA memory_limit='10GB';")  # Çok düşük bellek sınırı  
         con.execute("PRAGMA temp_directory='/tmp';")  # Temp dosyaları disk kullan
         con.execute("PRAGMA enable_optimizer=true;")
-        con.execute("PRAGMA force_parallelism=false;")  # Parallellik azalt
-        con.execute("PRAGMA max_temp_directory_size='8GB';")  # Temp boyutunu sınırla
-    except Exception:
-        pass
+        con.execute("PRAGMA force_parallelism=false;")  # Parallellik kapat
+        con.execute("PRAGMA max_temp_directory_size='2GB';")  # Çok küçük temp
+        con.execute("PRAGMA preserve_insertion_order=false;")  # Insertion order korunmasın
+        con.execute("PRAGMA enable_progress_bar=false;")  # Progress bar kapalı
+        con.execute("PRAGMA enable_profiling=false;")  # Profiling kapalı
+        con.execute("PRAGMA worker_threads=1;")  # Worker thread sayısını azalt
+        print(f"[MEMORY] DuckDB configured with 10GB limit")
+    except Exception as e:
+        print(f"[MEMORY] DuckDB configuration warning: {e}")
     con.register("sessions_df", s)
 
     # sınırlar ve anahtarlar
@@ -392,7 +430,8 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM read_parquet('{DATA_DIR}/user/metadata.parquet')
     """)
 
-    # as-of join + oranlar
+    # Bellek optimizasyonu: daha basit window fonksiyonları kullan
+    windows = (7, 30)  # Sadece en önemli pencereler
     rate_cols, ctr_cols, sel_sw, sel_tt = [], [], [], []
     for w in windows:
         sel_sw += [f"r.click_{w}d AS click_{w}d", f"r.order_{w}d AS order_{w}d"]
@@ -512,71 +551,150 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         LEFT JOIN meta m ON m.content_id_hashed = s.content_id_hashed
         LEFT JOIN user_meta um ON um.user_id_hashed = s.user_id_hashed
     """
-    out = con.execute(sql).df()
+    
+    # Bellek-dostu yaklaşım: veriyi küçük parçalarda işle
+    try:
+        # Önce satır sayısını kontrol et
+        row_count = con.execute("SELECT COUNT(*) FROM sessions_df").fetchone()[0]
+        print(f"[MEMORY] Processing {row_count:,} rows...")
+        
+        if row_count > 200000:  # 200K'dan fazla satır varsa basitleştirilmiş query
+            print(f"[MEMORY] Large dataset detected, using simplified query...")
+            check_memory_usage()
+            
+            # Çok basitleştirilmiş SQL - sadece en kritik features
+            simplified_sql = f"""
+                WITH s AS (SELECT *, CAST(session_date AS DATE) AS sdate FROM sessions_df)
+                SELECT
+                    s.*,
+                    -- Sadece en önemli rate columns (7d ve 30d)
+                    (COALESCE(swf.click_7d,0)+1.0)/(COALESCE(swf.click_7d,0)+4.0) AS click_rate_7d,
+                    (COALESCE(swf.click_30d,0)+1.0)/(COALESCE(swf.click_30d,0)+4.0) AS click_rate_30d,
+                    (COALESCE(swf.order_7d,0)+1.0)/(COALESCE(swf.click_7d,0)+4.0) AS order_rate_7d,
+                    (COALESCE(swf.order_30d,0)+1.0)/(COALESCE(swf.click_30d,0)+4.0) AS order_rate_30d,
+                    -- Temel CTR
+                    (COALESCE(ttf.clk_7d,0)+1.0)/(COALESCE(ttf.imp_7d,0)+4.0) AS tc_ctr_7d,
+                    (COALESCE(ttf.clk_30d,0)+1.0)/(COALESCE(ttf.imp_30d,0)+4.0) AS tc_ctr_30d,
+                    -- Fiyat ve rating
+                    COALESCE(prrf.rate_avg, 3.0) AS rating_avg,
+                    LOG(1 + COALESCE(prrf.selling_price,100)) AS log_selling_price,
+                    CASE
+                      WHEN prrf.original_price IS NOT NULL AND prrf.original_price > 0
+                      THEN (prrf.original_price - COALESCE(prrf.discounted_price, prrf.selling_price)) / prrf.original_price
+                      ELSE 0.0
+                    END AS discount_pct
+                FROM s
+                LEFT JOIN LATERAL (
+                    SELECT r.d, {', '.join(sel_sw)}
+                    FROM sitewide_roll r
+                    WHERE r.content_id_hashed = s.content_id_hashed AND r.d <= s.sdate
+                    ORDER BY r.d DESC LIMIT 1
+                ) AS swf ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT r.d, {', '.join(sel_tt)}
+                    FROM termcontent_roll r
+                    WHERE r.content_id_hashed = s.content_id_hashed 
+                      AND r.search_term_normalized = s.search_term_normalized 
+                      AND r.d <= s.sdate
+                    ORDER BY r.d DESC LIMIT 1
+                ) AS ttf ON TRUE
+                LEFT JOIN price_rating_features prrf ON prrf.content_id_hashed = s.content_id_hashed
+            """
+            out = con.execute(simplified_sql).df()
+            check_memory_usage()
+            
+        elif row_count > 500000:  # 500K'dan fazla satır varsa chunk'lara böl
+            print(f"[MEMORY] Very large dataset, processing in chunks...")
+            
+            # User ID'lere göre chunk'lara böl
+            unique_users = con.execute("SELECT DISTINCT user_id_hashed FROM sessions_df ORDER BY user_id_hashed").df()['user_id_hashed'].tolist()
+            chunk_size = max(50, len(unique_users) // 8)  # En az 8 chunk
+            
+            chunks = []
+            for i in range(0, len(unique_users), chunk_size):
+                user_chunk = unique_users[i:i+chunk_size]
+                user_list = "', '".join(map(str, user_chunk))
+                
+                chunk_sql = sql + f" WHERE s.user_id_hashed IN ('{user_list}')"
+                chunk_df = con.execute(chunk_sql).df()
+                chunks.append(chunk_df)
+                
+                # Explicit garbage collection
+                import gc
+                gc.collect()
+                print(f"[MEMORY] Processed chunk {len(chunks)}/{(len(unique_users) + chunk_size - 1) // chunk_size}")
+            
+            # Chunk'ları birleştir
+            out = pd.concat(chunks, ignore_index=True)
+            del chunks  # Belleği temizle
+            import gc
+            gc.collect()
+            
+        else:
+            # Küçük dataset için normal işlem
+            out = con.execute(sql).df()
+            
+    except Exception as e:
+        print(f"[MEMORY] Error in chunked processing: {e}, falling back to minimal features")
+        
+        # Minimal feature set - sadece en temel özellikler
+        try:
+            minimal_sql = """
+                WITH s AS (SELECT *, CAST(session_date AS DATE) AS sdate FROM sessions_df)
+                SELECT s.*,
+                       -- Sadece en temel features
+                       COALESCE(prrf.rate_avg, 3.0) AS rating_avg,
+                       LOG(1 + COALESCE(prrf.selling_price,100)) AS log_selling_price,
+                       CASE
+                         WHEN prrf.original_price IS NOT NULL AND prrf.original_price > 0
+                         THEN (prrf.original_price - COALESCE(prrf.discounted_price, prrf.selling_price)) / prrf.original_price
+                         ELSE 0.0
+                       END AS discount_pct
+                FROM s
+                LEFT JOIN price_rating_features prrf ON prrf.content_id_hashed = s.content_id_hashed
+            """
+            out = con.execute(minimal_sql).df()
+            print("[MEMORY] Using minimal feature set due to memory constraints")
+        except Exception as final_e:
+            print(f"[MEMORY] Final fallback failed: {final_e}, returning basic session data")
+            out = s.copy()  # En son çare olarak sadece session verisi
+    
     drop_cols = [c for c in out.columns if c in {"sdate"} or c.endswith(".d") or c.endswith("_d")]
     out = out.drop(columns=list(set(drop_cols)), errors="ignore")
 
+    # Bellek kontrolü
+    check_memory_usage()
+
     # >>> OTURUM-İÇİ SİNYALLERİ BURADA EKLE <<<
-    out = add_in_session_features(out) 
-    # 7g - 30g trend sinyalleri + yeni kombinasyonlar
-    out["trend_order_rate_7v30"] = out.get("order_rate_7d", 0).fillna(0) - out.get("order_rate_30d", 0).fillna(0)
-    out["trend_tc_ctr_7v30"]     = out.get("tc_ctr_7d", 0).fillna(0)       - out.get("tc_ctr_30d", 0).fillna(0)
+    try:
+        out = add_in_session_features(out) 
+    except Exception as e:
+        print(f"[MEMORY] Skipping in-session features due to memory: {e}")
     
-    # Yeni trend kombinasyonları (3g vs 14g, 14g vs 60g)
-    if "order_rate_3d" in out.columns and "order_rate_14d" in out.columns:
-        out["trend_order_rate_3v14"] = out["order_rate_3d"].fillna(0) - out["order_rate_14d"].fillna(0)
-    if "order_rate_14d" in out.columns and "order_rate_60d" in out.columns:
-        out["trend_order_rate_14v60"] = out["order_rate_14d"].fillna(0) - out["order_rate_60d"].fillna(0)
-    
-    # CTR trendleri
-    if "tc_ctr_3d" in out.columns and "tc_ctr_14d" in out.columns:
-        out["trend_tc_ctr_3v14"] = out["tc_ctr_3d"].fillna(0) - out["tc_ctr_14d"].fillna(0)
-    if "tc_ctr_14d" in out.columns and "tc_ctr_60d" in out.columns:
-        out["trend_tc_ctr_14v60"] = out["tc_ctr_14d"].fillna(0) - out["tc_ctr_60d"].fillna(0)
-
-    # --- NEW: trend & interaction features ---
-    # Güvenli oranlar (0 bölme yok)
-    eps = 1e-4
-    for a, b, name in [
-        ("order_rate_7d", "order_rate_30d", "trend_order_7v30"),
-        ("tc_ctr_7d",     "tc_ctr_30d",     "trend_tcctr_7v30"),
-        ("click_7d",      "click_30d",      "trend_swclick_7v30"),   # sitewide click sayıları varsa
-        ("order_7d",      "order_30d",      "trend_sworder_7v30"),   # sitewide order sayıları varsa
-    ]:
-        if a in out.columns and b in out.columns:
-            out[name] = (out[a].fillna(0) + eps) / (out[b].fillna(0) + eps)
-
-    # Promosyon x Kalite sinyali
-    if "discount_pct" in out.columns and "rating_avg" in out.columns:
-        out["promo_x_rating"] = out["discount_pct"].clip(lower=0).fillna(0) * (out["rating_avg"].fillna(0) / 5.0)
-    
-    # Yeni cross-feature'lar
-    # Fiyat vs Kalite dengesi  
-    if "log_discounted_price" in out.columns and "rating_avg" in out.columns:
-        out["price_quality_ratio"] = (out["log_discounted_price"].fillna(0) + eps) / (out["rating_avg"].fillna(0) + eps)
-    
-    # Popülerlik kombinasyonları
-    if "click_7d" in out.columns and "tc_ctr_7d" in out.columns:
-        out["popularity_x_relevance_7d"] = out["click_7d"].fillna(0) * out["tc_ctr_7d"].fillna(0)
-    if "order_7d" in out.columns and "order_rate_7d" in out.columns:
-        out["volume_x_conversion_7d"] = out["order_7d"].fillna(0) * out["order_rate_7d"].fillna(0)
-    
-    # Kullanıcı-ürün uyumu
-    if "user_term_ctr_30d" in out.columns and "tc_ctr_7d" in out.columns:
-        out["user_content_alignment"] = out["user_term_ctr_30d"].fillna(0) * out["tc_ctr_7d"].fillna(0)
-    
-    # Zamanlama sinyalleri
-    if "days_since_creation" in out.columns:
-        # Yeni ürün bonusu (yeni ürünler daha az veriye sahip)
-        out["newness_factor"] = np.exp(-out["days_since_creation"].clip(0, 365) / 30.0)
-        # Eski ürün stabilite faktörü
-        out["maturity_factor"] = np.minimum(out["days_since_creation"].clip(0, 730) / 365.0, 2.0)
+    # Basit trend sinyalleri - bellek dostu versiyon
+    try:
+        # 7g - 30g trend sinyalleri (sadece temel olanlar)
+        if "order_rate_7d" in out.columns and "order_rate_30d" in out.columns:
+            out["trend_order_rate_7v30"] = out.get("order_rate_7d", 0).fillna(0) - out.get("order_rate_30d", 0).fillna(0)
+        if "tc_ctr_7d" in out.columns and "tc_ctr_30d" in out.columns:
+            out["trend_tc_ctr_7v30"] = out.get("tc_ctr_7d", 0).fillna(0) - out.get("tc_ctr_30d", 0).fillna(0)
+        
+        # Basit interaction features - bellek dostu
+        eps = 1e-4
+        if "discount_pct" in out.columns and "rating_avg" in out.columns:
+            out["promo_x_rating"] = out["discount_pct"].clip(lower=0).fillna(0) * (out["rating_avg"].fillna(3.0) / 5.0)
+        
+        print("[MEMORY] Added basic trend and interaction features")
+    except Exception as e:
+        print(f"[MEMORY] Skipping complex features due to memory: {e}")
 
     out = reduce_memory_df(out)
     print("[TA] DuckDB builder -> done")
     
-    # Bellek temizliği
-    gc.collect()
+    # Bellek temizliği ve final kontrol
+    check_memory_usage()
+    free_memory()
+    con.close()  # DuckDB connection'ı kapat
     
     return out
 
