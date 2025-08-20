@@ -779,50 +779,50 @@ def add_in_session_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------- basit TA baseline ----------------------
 def score_timeaware_baseline(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    # Güvenli kolon getirici: yoksa sıfır serisi döner
+    def col(name: str, default: float = 0.0) -> pd.Series:
+        if name in out.columns:
+            return pd.to_numeric(out[name], errors="coerce")
+        return pd.Series(default, index=out.index, dtype="float32")
     
     # Ana click prediction - daha sofistike kombinasyon
     out["pred_click"] = (
         0.45 * out.get("tc_ctr_7d", 0) + 
         0.25 * out.get("tc_ctr_30d", 0) +
-        0.15 * out.get("tc_ctr_3d", 0) +  # Kısa term trend
-        0.10 * out.get("content_search_ctr_7d", 0) +  # Content genel performansı
-        0.05 * out.get("user_term_ctr_30d", 0)  # User-term uyumu
+        0.15 * out.get("tc_ctr_3d", 0) +
+        0.10 * out.get("content_search_ctr_7d", 0) +
+        0.05 * out.get("user_term_ctr_30d", 0)
     )
     
-    # Ana order prediction - daha sofistike kombinasyon
+    # Ana order prediction
     out["pred_order"] = (
         0.50 * out.get("order_rate_7d", 0) + 
         0.25 * out.get("order_rate_30d", 0) +
-        0.15 * out.get("order_rate_3d", 0) +  # Kısa term trend
-        0.10 * out.get("order_rate_14d", 0)   # Orta term trend
+        0.15 * out.get("order_rate_3d", 0) +
+        0.10 * out.get("order_rate_14d", 0)
     )
     
-    # Promosyon bonusu (daha agresif)
-    discount_bonus = 0.08 * out.get("discount_pct", 0).clip(lower=0).fillna(0)
-    out["pred_order"] += discount_bonus
+    # Promosyon bonusu ve kalite bonusu (kolon yoksa 0 seri)
+    discount_bonus = 0.08 * col("discount_pct", 0.0).clip(lower=0).fillna(0)
+    out["pred_order"] = pd.to_numeric(out["pred_order"], errors="coerce").fillna(0) + discount_bonus
     
-    # Kalite bonusu (normalleştirilmiş)
-    rating_bonus = 0.04 * (out.get("rating_avg", 0).fillna(0) / 5.0)
+    rating_bonus = 0.04 * (col("rating_avg", 0.0).fillna(0) / 5.0)
     out["pred_order"] += rating_bonus
     
-    # Popülerlik bonusu (yeni)
-    if "popularity_x_relevance_7d" in out.columns:
-        out["pred_order"] += 0.03 * out["popularity_x_relevance_7d"].fillna(0)
-    
-    # User alignment bonusu
-    if "user_content_alignment" in out.columns:
-        out["pred_click"] += 0.04 * out["user_content_alignment"].fillna(0)
-        out["pred_order"] += 0.02 * out["user_content_alignment"].fillna(0)
+    # Popülerlik ve kullanıcı hizalaması bonusları (varsa)
+    out["pred_order"] += 0.03 * col("popularity_x_relevance_7d", 0.0).fillna(0)
+    out["pred_click"] += 0.04 * col("user_content_alignment", 0.0).fillna(0)
+    out["pred_order"] += 0.02 * col("user_content_alignment", 0.0).fillna(0)
     
     # Trend bonusları
-    trend_order_bonus = 0.05 * out.get("trend_order_rate_7v30", 0).fillna(0).clip(-0.5, 0.5)
-    trend_ctr_bonus = 0.03 * out.get("trend_tc_ctr_7v30", 0).fillna(0).clip(-0.5, 0.5)
-    
+    trend_order_bonus = 0.05 * col("trend_order_rate_7v30", 0.0).fillna(0).clip(-0.5, 0.5)
+    trend_ctr_bonus   = 0.03 * col("trend_tc_ctr_7v30", 0.0).fillna(0).clip(-0.5, 0.5)
     out["pred_order"] += trend_order_bonus
     out["pred_click"] += trend_ctr_bonus
     
-    # Final blend (order'a daha fazla ağırlık)
-    out["pred_final"] = 0.82 * out["pred_order"] + 0.18 * out["pred_click"]
+    # Final blend
+    out["pred_final"] = 0.82 * out["pred_order"].astype("float32") + 0.18 * out["pred_click"].astype("float32")
     
     return out
 
