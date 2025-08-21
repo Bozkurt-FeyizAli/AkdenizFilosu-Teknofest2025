@@ -874,9 +874,9 @@ def run_train_xgb():
         tree_method="hist",
         max_depth=8, n_estimators=2400, learning_rate=0.055,
         subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=0.0, reg_lambda=1.0, random_state=42,
+        reg_alpha=0.0, reg_lambda=1.0,
         n_jobs=os.cpu_count(),
-        random_state=42,
+        random_state=42
     )
     ranker.fit(X_tr, y_tr, group=group_tr.tolist(),
                eval_set=[(X_va, y_va)], eval_group=[group_va.tolist()],
@@ -936,7 +936,7 @@ def run_train_cat():
         loss_function="YetiRank", eval_metric="NDCG:top=10",
         iterations=4000, learning_rate=0.05, depth=8, l2_leaf_reg=3.0,
         random_strength=1.0, bootstrap_type="Bayesian",
-        od_type="Iter", od_wait=400, verbose=100, random_seed=42,
+        od_type="Iter", od_wait=400, verbose=100,
         thread_count=os.cpu_count(),
         random_seed=42,
     )
