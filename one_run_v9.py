@@ -1,39 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-one_run_v9.py — Tek dosyalık ranking pipeline (Trendyol Kaggle)
+one_run_v9.py — Tek dosyalık pipeline
 
-KULLANIM (örnek):
-  # 1) LTR (LightGBM LambdaRank) eğit
-  python3 one_run_v9.py --train_ltr --alpha 0.80
-
-  # 2) Dörtlü ensemble ile submission üret (LTR+XGB+CatBoost+TA)
-  python3 one_run_v9.py --infer_ensemble \
-    --alpha 0.85 \
-    --w_ltr 0.70 --w_xgb 0.15 --w_cb 0.15 --w_ta 0.00 \
-    --out outputs/sub_ens.csv
-
-  # Sadece TA baseline
-  python3 one_run_v9.py --baseline_timeaware --out outputs/ta.csv
-
-  # (Opsiyonel) XGBoost / CatBoost eğitim & infer
-  python3 one_run_v9.py --train_xgb
-  python3 one_run_v9.py --infer_xgb --out outputs/sub_xgb.csv
-  python3 one_run_v9.py --train_cat
-  python3 one_run_v9.py --infer_cat --out outputs/sub_cat.csv
-
-NOTLAR:
-- Kaggle no-internet: Sentence-Transformers indiremeyebilir. Varsayılan olarak kapalı:
-  USE_TEXT_SIM=0 (ENV ile aç/kapat: USE_TEXT_SIM=1)
-- Veri kökü: ./data (competition dataset'i buraya kopyalayın)
+Komutlar (örnekler en altta):
+  --baseline_timeaware                        : TA özellikleri + TA baseline ile submission
+  --train_ltr --alpha 0.80                    : TA özelliklerden LTR (click & order) eğit
+  --infer_ltr  --alpha 0.80 --out out.csv     : Kaydedilen LTR modellerle submission
+  --infer_blend --alpha 0.80 --beta 0.30      : LTR ⊕ TA blend submission
+  --train_xgb / --infer_xgb                   : XGBoost Ranker eğitim / infer
+  --train_cat / --ianfer_cat                   : CatBoost YetiRank eğitim / infer
+  --infer_ensemble [w_ltr w_xgb w_cb w_ta]    : LTR + XGB + CatBoost + TA ensemble
 """
 
 import os, time, argparse, numpy as np, pandas as pd
 import duckdb
 import lightgbm as lgb
-from sklearn.metrics import roc_auc_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-
-# XGBoost & CatBoost opsiyonel (yüklü değilse pipeline yine çalışır)
+# XGBoost & CatBoost opsiyonel — sistemde yoksa import hatası vermesin
 try:
     import xgboost as xgb
     from xgboost import XGBRanker
@@ -47,8 +32,9 @@ except Exception:
     CatBoostRanker = None
     Pool = None
 
+
 # ---------------------- genel ayarlar ----------------------
-DATA_DIR   = "data"
+DATA_DIR = "data"
 MODELS_DIR = "models"
 os.makedirs("outputs", exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -58,7 +44,8 @@ class timer:
     def __enter__(self): self.t0=time.time(); print(f"[TIMER] {self.msg} ..."); return self
     def __exit__(self, *a): print(f"[TIMER] {self.msg} done in {time.time()-self.t0:.2f}s")
 
-def set_seed(s=42): np.random.seed(s)
+def set_seed(s=42):
+    np.random.seed(s)
 
 def reduce_memory_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
@@ -79,150 +66,24 @@ def load_sample_submission_session_ids(path=os.path.join(DATA_DIR,"sample_submis
     idx = pd.read_csv(path, usecols=["session_id"])["session_id"].astype(str)
     return idx
 
-# ====================== METİN BENZERLİK ÖZELLİĞİ (güvenli-kapı) ======================
-def generate_text_similarity_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    (Opsiyonel) Sentence-Transformers ile search_term vs cv_tags cosine similarity.
-    ENV: USE_TEXT_SIM=1 ise dener, yoksa atlar.
-    Kaggle no-internet'te otomatik atlanır.
-    """
-    with timer("Text Similarity Feature Generation"):
-        if os.environ.get("USE_TEXT_SIM", "0") != "1":
-            print("[INFO] Text similarity disabled by env."); 
-            df["term_cv_similarity"] = 0.0
-            return df
+def make_submission(scored: pd.DataFrame, out_path: str,
+                    session_index: pd.Series | None = None,
+                    expected_sessions: int | None = None):
+    """scored: ['session_id','content_id_hashed','pred_final']"""
+    sub = (scored.sort_values(["session_id","pred_final"], ascending=[True, False])
+                 .groupby("session_id")["content_id_hashed"]
+                 .apply(lambda x: " ".join(x.astype(str))).reset_index())
+    sub.columns = ["session_id","prediction"]
+    sub["session_id"] = sub["session_id"].astype(str)
 
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            print("[WARN] sentence-transformers yok. Bu özellik atlanıyor.")
-            df["term_cv_similarity"] = 0.0
-            return df
+    if session_index is not None:
+        sub = session_index.to_frame().merge(sub, on="session_id", how="left").fillna({"prediction": ""})
+    if expected_sessions is not None:
+        assert sub.shape[0] == expected_sessions, f"Submission rows {sub.shape[0]} != {expected_sessions}"
 
-        MODEL_NAME = 'paraphrase-multilingual-MiniLM-L12-v2'
-        EMB_DIR = os.path.join(MODELS_DIR, "embeddings")
-        os.makedirs(EMB_DIR, exist_ok=True)
-        
-        term_emb_path = os.path.join(EMB_DIR, "term_embeddings.npz")
-        content_emb_path = os.path.join(EMB_DIR, "content_embeddings.npz")
+    sub.to_csv(out_path, index=False)
+    print(f"[OK] Submission written -> {out_path} (rows={len(sub):,})")
 
-        def _safe_load_or_none(path):
-            try:
-                if os.path.exists(path):
-                    data = np.load(path, allow_pickle=True)
-                    return data['keys'], data['vectors']
-            except Exception:
-                return None, None
-            return None, None
-
-        try:
-            model = SentenceTransformer(MODEL_NAME)
-        except Exception as e:
-            print(f"[WARN] ST model yüklenemedi ({e}). Bu özellik atlanıyor.")
-            df["term_cv_similarity"] = 0.0
-            return df
-
-        # --- Arama terimleri ---
-        unique_terms, term_embeddings = _safe_load_or_none(term_emb_path)
-        if unique_terms is None:
-            print("Arama terimi embedding'leri oluşturuluyor...")
-            s_tr = pd.read_parquet(os.path.join(DATA_DIR, "train_sessions.parquet"), columns=["search_term_normalized"])
-            s_te = pd.read_parquet(os.path.join(DATA_DIR, "test_sessions.parquet"), columns=["search_term_normalized"])
-            unique_terms = pd.concat([s_tr, s_te])["search_term_normalized"].dropna().unique()
-            term_embeddings = model.encode(unique_terms, show_progress_bar=True, convert_to_numpy=True)
-            np.savez_compressed(term_emb_path, keys=unique_terms, vectors=term_embeddings)
-            del s_tr, s_te
-        term_to_emb = {t: e for t, e in zip(unique_terms, term_embeddings)}
-
-        # --- Ürün cv_tags ---
-        unique_contents, content_embeddings = _safe_load_or_none(content_emb_path)
-        if unique_contents is None:
-            print("Ürün (cv_tags) embedding'leri oluşturuluyor...")
-            meta = pd.read_parquet(os.path.join(DATA_DIR, "content/metadata.parquet"),
-                                   columns=["content_id_hashed","cv_tags"])
-            meta = meta.dropna(subset=["content_id_hashed","cv_tags"]).drop_duplicates("content_id_hashed").set_index("content_id_hashed")
-            unique_contents = meta.index.to_numpy()
-            tags_to_encode = meta.loc[unique_contents, "cv_tags"].astype(str).tolist()
-            content_embeddings = model.encode(tags_to_encode, show_progress_bar=True, convert_to_numpy=True)
-            np.savez_compressed(content_emb_path, keys=unique_contents, vectors=content_embeddings)
-            del meta
-        content_to_emb = {cid: e for cid, e in zip(unique_contents, content_embeddings)}
-
-        print("Benzerlik skorları hesaplanıyor...")
-        term_vecs = df["search_term_normalized"].map(term_to_emb).tolist()
-        content_vecs = df["content_id_hashed"].map(content_to_emb).tolist()
-
-        emb_dim = term_embeddings.shape[1]
-        default_vec = np.zeros(emb_dim, dtype=np.float32)
-        term_vecs_np = np.array([v if v is not None else default_vec for v in term_vecs])
-        content_vecs_np = np.array([v if v is not None else default_vec for v in content_vecs])
-
-        num = np.sum(term_vecs_np * content_vecs_np, axis=1)
-        den = np.linalg.norm(term_vecs_np, axis=1) * np.linalg.norm(content_vecs_np, axis=1)
-        sim = np.divide(num, den, out=np.zeros_like(num, dtype=float), where=den!=0)
-        df["term_cv_similarity"] = sim.astype("float32")
-    return df
-
-# ====================== KULLANICI PROFİLİ (favori kategori + fiyat) ======================
-def _load_price_last():
-    price = pd.read_parquet(os.path.join(DATA_DIR,"content/price_rate_review_data.parquet"))
-    # isim esnekliği
-    if "update_date" not in price.columns:
-        cands = [c for c in price.columns if "update_date" in c]
-        if cands: price = price.rename(columns={cands[0]:"update_date"})
-    cols = [c for c in ["content_id_hashed","selling_price","update_date"] if c in price.columns]
-    price = price[cols].sort_values("update_date").drop_duplicates("content_id_hashed", keep="last")
-    return price[["content_id_hashed","selling_price"]]
-
-def generate_user_profile_features(df: pd.DataFrame) -> pd.DataFrame:
-    with timer("User Profile Feature Generation"):
-        profile_path = os.path.join(MODELS_DIR, "user_profiles.parquet")
-
-        if os.path.exists(profile_path):
-            user_profiles = pd.read_parquet(profile_path)
-        else:
-            print("Kullanıcı profilleri oluşturuluyor...")
-            sessions = pd.read_parquet(os.path.join(DATA_DIR,"train_sessions.parquet"),
-                                       columns=["user_id_hashed","content_id_hashed","ordered"])
-            meta = pd.read_parquet(os.path.join(DATA_DIR,"content/metadata.parquet"),
-                                   columns=["content_id_hashed","leaf_category_name"])
-            price_last = _load_price_last()
-
-            ordered_sessions = (sessions[sessions['ordered']==1]
-                                .dropna(subset=['user_id_hashed'])
-                                .merge(meta, on="content_id_hashed", how="left")
-                                .merge(price_last, on="content_id_hashed", how="left"))
-
-            fav_cat = (ordered_sessions.groupby(["user_id_hashed","leaf_category_name"])
-                                      .size().reset_index(name="counts")
-                                      .sort_values(["user_id_hashed","counts"], ascending=[True,False])
-                                      .drop_duplicates("user_id_hashed")
-                                      .rename(columns={"leaf_category_name":"user_fav_category"}))
-
-            avg_price = (ordered_sessions.groupby("user_id_hashed")["selling_price"]
-                                       .mean().reset_index()
-                                       .rename(columns={"selling_price":"user_avg_order_price"}))
-
-            user_profiles = fav_cat[["user_id_hashed","user_fav_category"]] \
-                                .merge(avg_price, on="user_id_hashed", how="outer")
-            user_profiles.to_parquet(profile_path)
-
-        # DF'e kategori & fiyat da eklensin (yoksa)
-        need_merge = []
-        if 'leaf_category_name' not in df.columns: need_merge.append("leaf_category_name")
-        if 'selling_price' not in df.columns: need_merge.append("selling_price")
-        if need_merge:
-            meta_cats = pd.read_parquet(os.path.join(DATA_DIR,"content/metadata.parquet"),
-                                        columns=["content_id_hashed","leaf_category_name"])
-            price_last = _load_price_last()
-            df = (df.merge(meta_cats, on="content_id_hashed", how="left")
-                    .merge(price_last, on="content_id_hashed", how="left"))
-
-        df = df.merge(user_profiles, on="user_id_hashed", how="left")
-        df["is_in_user_fav_category"] = (df["leaf_category_name"]==df["user_fav_category"]).astype("int8")
-        df["price_vs_user_avg"] = (df["selling_price"].fillna(0) / (df["user_avg_order_price"].fillna(0)+1e-6)).astype("float32")
-        df = df.drop(columns=["user_fav_category","user_avg_order_price","leaf_category_name"], errors="ignore")
-    return df
 
 # ---------------------- time-aware özellik inşası (DuckDB) ----------------------
 def _mk_roll(win: int, alias_prefix: str, col: str, part_cols: str) -> str:
@@ -232,6 +93,46 @@ def _mk_roll(win: int, alias_prefix: str, col: str, part_cols: str) -> str:
 
 def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.DataFrame:
     print("[TA] DuckDB builder -> start")
+    print("[FEAT] Calculating TF-IDF similarities...")
+    try:
+        # Ürün meta verilerini ve arama terimlerini yükle
+        meta_content = pd.read_parquet(os.path.join(DATA_DIR, 'content/metadata.parquet'), columns=['content_id_hashed', 'cv_tags', 'level2_category_name'])
+        meta_content['text_features'] = meta_content['cv_tags'].fillna('') + ' ' + meta_content['level2_category_name'].fillna('')
+
+        # Oturumlardaki tüm benzersiz arama terimleri
+        search_terms = sessions[['search_term_normalized']].drop_duplicates().reset_index(drop=True)
+
+        # TF-IDF Vectorizer
+        vectorizer = TfidfVectorizer(min_df=3, max_features=10000)
+        
+        # Hem ürün metinlerini hem de arama terimlerini birlikte fit et
+        all_text = pd.concat([meta_content['text_features'], search_terms['search_term_normalized']], axis=0)
+        vectorizer.fit(all_text)
+
+        # Vektörleri oluştur
+        tfidf_content = vectorizer.transform(meta_content['text_features'])
+        tfidf_terms = vectorizer.transform(search_terms['search_term_normalized'])
+
+        # Kosinüs benzerliklerini hesapla
+        # Bu, her arama terimi için her ürünle olan benzerlik skorunu içeren bir matris oluşturur
+        cosine_sim_matrix = cosine_similarity(tfidf_terms, tfidf_content)
+
+        # Sonuçları DataFrame'e dönüştür
+        sim_df = pd.DataFrame(cosine_sim_matrix, index=search_terms['search_term_normalized'])
+        sim_df.columns = meta_content['content_id_hashed']
+        
+        # DataFrame'i "unpivot" ederek (session, content) -> score formatına getir
+        sim_df = sim_df.stack().reset_index()
+        sim_df.columns = ['search_term_normalized', 'content_id_hashed', 'term_content_tfidf_sim']
+        
+        # Ana sessions verisine bu yeni özelliği ekle
+        sessions = sessions.merge(sim_df, on=['search_term_normalized', 'content_id_hashed'], how='left')
+        sessions['term_content_tfidf_sim'] = sessions['term_content_tfidf_sim'].fillna(0).astype('float32')
+        print("[FEAT] TF-IDF similarities added.")
+    except Exception as e:
+        print(f"[WARN] TF-IDF feature generation failed: {e}")
+        sessions['term_content_tfidf_sim'] = 0.0
+    # --- YENİ TF-IDF ÖZELLİĞİ SONU ---
     need = [c for c in [
         "ts_hour","search_term_normalized","content_id_hashed","session_id",
         "clicked","ordered","added_to_cart","added_to_fav","user_id_hashed"
@@ -248,6 +149,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         pass
     con.register("sessions_df", s)
 
+    # sınırlar ve anahtarlar
     min_d, max_d = con.execute("SELECT MIN(session_date)::DATE, MAX(session_date)::DATE FROM sessions_df").fetchone()
     con.execute(f"CREATE OR REPLACE TEMP VIEW sess_bounds AS SELECT DATE '{min_d}' AS min_d, DATE '{max_d}' AS max_d")
     con.execute("CREATE OR REPLACE TEMP VIEW key_c AS SELECT DISTINCT content_id_hashed FROM sessions_df")
@@ -345,14 +247,14 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM ut ORDER BY user_id_hashed, search_term_normalized, d
     """)
 
-    # user sitewide rolling
-    u_sw_exprs=[]
+    # NEW: user sitewide rolling (click/cart/fav/order)
+    u_sw_exprs = []
     for w in windows:
         u_sw_exprs += [
-            _mk_roll(w,"u_sw_click","total_click","user_id_hashed"),
-            _mk_roll(w,"u_sw_cart","total_cart","user_id_hashed"),
-            _mk_roll(w,"u_sw_fav","total_fav","user_id_hashed"),
-            _mk_roll(w,"u_sw_order","total_order","user_id_hashed"),
+            _mk_roll(w, f"u_sw_click", "total_click", "user_id_hashed"),
+            _mk_roll(w, f"u_sw_cart",  "total_cart",  "user_id_hashed"),
+            _mk_roll(w, f"u_sw_fav",   "total_fav",   "user_id_hashed"),
+            _mk_roll(w, f"u_sw_order", "total_order", "user_id_hashed"),
         ]
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW u_sw_roll AS
@@ -371,12 +273,12 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM u ORDER BY user_id_hashed, d
     """)
 
-    # user arama rolling
-    u_search_exprs=[]
+    # NEW: user search rolling (impression/click)
+    u_search_exprs = []
     for w in windows:
         u_search_exprs += [
-            _mk_roll(w,"u_search_imp","total_search_impression","user_id_hashed"),
-            _mk_roll(w,"u_search_clk","total_search_click","user_id_hashed"),
+            _mk_roll(w, f"u_search_imp", "total_search_impression", "user_id_hashed"),
+            _mk_roll(w, f"u_search_clk", "total_search_click",      "user_id_hashed"),
         ]
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW u_search_roll AS
@@ -393,12 +295,12 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM u ORDER BY user_id_hashed, d
     """)
 
-    # content arama rolling
-    c_search_exprs=[]
+    # NEW: content search rolling (impression/click)
+    c_search_exprs = []
     for w in windows:
         c_search_exprs += [
-            _mk_roll(w,"c_search_imp","total_search_impression","content_id_hashed"),
-            _mk_roll(w,"c_search_clk","total_search_click","content_id_hashed"),
+            _mk_roll(w, f"c_search_imp", "total_search_impression", "content_id_hashed"),
+            _mk_roll(w, f"c_search_clk", "total_search_click",      "content_id_hashed"),
         ]
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW c_search_roll AS
@@ -415,12 +317,12 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM c ORDER BY content_id_hashed, d
     """)
 
-    # term-only rolling
-    t_search_exprs=[]
+    # NEW: term-only rolling
+    t_search_exprs = []
     for w in windows:
         t_search_exprs += [
-            _mk_roll(w,"t_imp","total_search_impression","search_term_normalized"),
-            _mk_roll(w,"t_clk","total_search_click","search_term_normalized"),
+            _mk_roll(w, f"t_imp", "total_search_impression", "search_term_normalized"),
+            _mk_roll(w, f"t_clk", "total_search_click",      "search_term_normalized"),
         ]
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW t_search_roll AS
@@ -436,7 +338,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM t ORDER BY search_term_normalized, d
     """)
 
-    # user×content fashion logs
+    # NEW: user×content fashion logs (search)
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW uf_roll AS
         WITH uf AS (
@@ -457,7 +359,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM uf ORDER BY user_id_hashed, content_id_hashed, d
     """)
 
-    # user×content fashion sitewide logs
+    # NEW: user×content fashion sitewide logs (click/cart/fav/order)
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW ufs_roll AS
         WITH ufs AS (
@@ -484,7 +386,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM ufs ORDER BY user_id_hashed, content_id_hashed, d
     """)
 
-    # meta geniş
+    # meta: genişletilmiş
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW meta AS
         SELECT content_id_hashed,
@@ -496,7 +398,7 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         FROM read_parquet('{DATA_DIR}/content/metadata.parquet')
     """)
 
-    # user metadata
+    # user metadata (numerik)
     con.execute(f"""
         CREATE OR REPLACE TEMP VIEW user_meta AS
         SELECT user_id_hashed,
@@ -537,12 +439,17 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
             LOG(1 + COALESCE(prrf.discounted_price,0)) AS log_discounted_price,
             LOG(1 + COALESCE(prrf.rate_cnt,0)) AS rating_log_cnt,
             (COALESCE(utf.u_clk_30d,0)+1.0)/(COALESCE(utf.u_imp_30d,0)+1.0+3.0) AS user_term_ctr_30d,
+            -- NEW: user sitewide rates
             {', '.join([f"(COALESCE(uswf.u_sw_cart_{w}d,0)+1.0)/(COALESCE(uswf.u_sw_click_{w}d,0)+1.0+3.0) AS user_sw_cart_rate_{w}d" for w in windows])},
             {', '.join([f"(COALESCE(uswf.u_sw_fav_{w}d,0)+1.0)/(COALESCE(uswf.u_sw_click_{w}d,0)+1.0+3.0) AS user_sw_fav_rate_{w}d" for w in windows])},
             {', '.join([f"(COALESCE(uswf.u_sw_order_{w}d,0)+1.0)/(COALESCE(uswf.u_sw_click_{w}d,0)+1.0+3.0) AS user_sw_order_rate_{w}d" for w in windows])},
+            -- NEW: user search ctr
             {', '.join([f"(COALESCE(usrf.u_search_clk_{w}d,0)+1.0)/(COALESCE(usrf.u_search_imp_{w}d,0)+1.0+3.0) AS user_search_ctr_{w}d" for w in windows])},
+            -- NEW: content search ctr
             {', '.join([f"(COALESCE(csr.c_search_clk_{w}d,0)+1.0)/(COALESCE(csr.c_search_imp_{w}d,0)+1.0+3.0) AS content_search_ctr_{w}d" for w in windows])},
+            -- NEW: term ctr
             {', '.join([f"(COALESCE(tsr.t_clk_{w}d,0)+1.0)/(COALESCE(tsr.t_imp_{w}d,0)+1.0+3.0) AS term_ctr_{w}d" for w in windows])},
+            -- NEW: user×content fashion ctr/order-rate 30d
             (COALESCE(ufr.uf_clk_30d,0)+1.0)/(COALESCE(ufr.uf_imp_30d,0)+1.0+3.0) AS user_content_fashion_ctr_30d,
             (COALESCE(ufsr.uf_sw_order_30d,0)+1.0)/(COALESCE(ufsr.uf_sw_click_30d,0)+1.0+3.0) AS user_content_fashion_order_rate_30d,
             COALESCE(DATEDIFF('day', m.creation_date, s.sdate), -1) AS days_since_creation,
@@ -624,84 +531,127 @@ def assemble_timeaware_features(sessions: pd.DataFrame, windows=(7,30)) -> pd.Da
         LEFT JOIN user_meta um ON um.user_id_hashed = s.user_id_hashed
     """
     out = con.execute(sql).df()
+    drop_cols = [c for c in out.columns if c in {"sdate"} or c.endswith(".d") or c.endswith("_d")]
+    out = out.drop(columns=list(set(drop_cols)), errors="ignore")
 
-    # (Opsiyonel) metin benzerliği
-    out = generate_text_similarity_features(out)
-    # Kullanıcı profil özellikleri
-    out = generate_user_profile_features(out)
-
-    # trend sinyalleri
+    # >>> OTURUM-İÇİ SİNYALLERİ BURADA EKLE <<<
+    out = add_in_session_features(out) 
+    # 7g - 30g trend sinyalleri
     out["trend_order_rate_7v30"] = out.get("order_rate_7d", 0).fillna(0) - out.get("order_rate_30d", 0).fillna(0)
     out["trend_tc_ctr_7v30"]     = out.get("tc_ctr_7d", 0).fillna(0)       - out.get("tc_ctr_30d", 0).fillna(0)
 
+    # --- NEW: trend & interaction features ---
+    # Güvenli oranlar (0 bölme yok)
     eps = 1e-4
     for a, b, name in [
-        ("order_rate_7d","order_rate_30d","trend_order_7v30"),
-        ("tc_ctr_7d","tc_ctr_30d","trend_tcctr_7v30"),
-        ("click_7d","click_30d","trend_swclick_7v30"),
-        ("order_7d","order_30d","trend_sworder_7v30"),
+        ("order_rate_7d", "order_rate_30d", "trend_order_7v30"),
+        ("tc_ctr_7d",     "tc_ctr_30d",     "trend_tcctr_7v30"),
+        ("click_7d",      "click_30d",      "trend_swclick_7v30"),   # sitewide click sayıları varsa
+        ("order_7d",      "order_30d",      "trend_sworder_7v30"),   # sitewide order sayıları varsa
     ]:
         if a in out.columns and b in out.columns:
             out[name] = (out[a].fillna(0) + eps) / (out[b].fillna(0) + eps)
 
+    # Promosyon x Kalite sinyali
     if "discount_pct" in out.columns and "rating_avg" in out.columns:
         out["promo_x_rating"] = out["discount_pct"].clip(lower=0).fillna(0) * (out["rating_avg"].fillna(0) / 5.0)
-
-    # oturum içi sinyaller
-    out = add_in_session_features(out)
 
     out = reduce_memory_df(out)
     print("[TA] DuckDB builder -> done")
     return out
 
+
+
 def add_in_session_features(df: pd.DataFrame) -> pd.DataFrame:
+    # deterministik sıra
     df = df.sort_values(["session_id","ts_hour","content_id_hashed"]).reset_index(drop=True)
+
+    # oturum adımı (0,1,2,...) ve item tekrar indeksi (aynı item oturumda kaçıncı kez)
     df["sess_step_idx"] = df.groupby("session_id").cumcount().astype("int32")
     g_item = df.groupby(["session_id","content_id_hashed"], sort=False)
     df["item_occ_idx"] = g_item.cumcount().astype("int16")
     df["seen_before"]  = (df["item_occ_idx"] > 0).astype("int8")
 
+    # bu item oturumda en son ne zaman/kaç adım önce görüldü
     prev_step = g_item["sess_step_idx"].shift()
     df["steps_since_item_last_seen"] = (df["sess_step_idx"] - prev_step).fillna(1e6).clip(0, 1e6).astype("float32")
     prev_time = g_item["ts_hour"].shift()
     df["secs_since_item_last_seen"]  = (df["ts_hour"] - prev_time).dt.total_seconds().fillna(1e9).clip(0, 1e9).astype("float32")
 
+    # bu item için geçmiş etkileşim sayıları (mevcut satır HARİÇ)
     for lab in ["clicked","added_to_cart","added_to_fav","ordered"]:
         if lab in df.columns:
             cum = g_item[lab].cumsum()
             df[f"{lab}_before_item_sess"] = (cum - df[lab]).astype("int16")
 
+    # oturum süresi (sn) ve oturum başlangıcından bu yana adım
     sess_start = df.groupby("session_id")["ts_hour"].transform("min")
     df["secs_since_session_start"] = (df["ts_hour"] - sess_start).dt.total_seconds().astype("float32")
-
-    # oturum içi rütbeler
-    if "log_discounted_price" in df.columns:
-        df["cheap_rank_sess"] = 1.0 - df.groupby("session_id")["log_discounted_price"].rank(method="first", pct=True)
-    if "discount_pct" in df.columns:
-        df["discount_rank_sess"] = df.groupby("session_id")["discount_pct"].rank(method="first", ascending=False, pct=True)
-
+    
+    # mevcut liste: ["order_rate_7d","tc_ctr_7d","discount_pct","rating_avg"]
     for base in ["order_rate_7d","tc_ctr_7d","discount_pct","rating_avg",
                  "log_discounted_price","trend_order_7v30","trend_tcctr_7v30"]:
         if base in df.columns:
             df[f"{base}_rank_sess"] = df.groupby("session_id")[base].rank(method="first", pct=True).astype("float32")
+        # ucuzluk ve indirim rütbeleri (oturum içi)
+        if "log_discounted_price" in df.columns:
+            df["cheap_rank_sess"] = 1.0 - df.groupby("session_id")["log_discounted_price"]\
+                .rank(method="first", pct=True)  # 1 = en ucuz
 
-    # zaman & karşılaştırmalar
+        if "discount_pct" in df.columns:
+            df["discount_rank_sess"] = df.groupby("session_id")["discount_pct"]\
+                .rank(method="first", ascending=False, pct=True)  # 1 = en yüksek indirim
+
+    
+    # oturum-içi göreli rütbeler (global öncülleri oturum içinde normalize et)
+    for base in ["order_rate_7d","tc_ctr_7d","discount_pct","rating_avg"]:
+        if base in df.columns:
+            df[f"{base}_rank_sess"] = df.groupby("session_id")[base].rank(method="first", pct=True).astype("float32")
+        # ucuzluk ve indirim rütbeleri (oturum içi)
+        if "log_discounted_price" in df.columns:
+            df["cheap_rank_sess"] = 1.0 - df.groupby("session_id")["log_discounted_price"]\
+                .rank(method="first", pct=True)  # 1 = en ucuz
+
+        if "discount_pct" in df.columns:
+            df["discount_rank_sess"] = df.groupby("session_id")["discount_pct"]\
+                .rank(method="first", ascending=False, pct=True)  # 1 = en yüksek indirim
+    print("[FEAT] Adding new relative in-session features...")
+    # --- YENİ EKLENEN ÖZELLİKLER ---
     df["hour_of_day"] = df["ts_hour"].dt.hour.astype("int8")
     df["day_of_week"] = df["ts_hour"].dt.dayofweek.astype("int8")
+    # Saat ve günün döngüsel olduğunu belirtmek için sin/cos transformasyonu
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour_of_day']/24.0).astype("float32")
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour_of_day']/24.0).astype("float32")
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week']/7.0).astype("float32")
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week']/7.0).astype("float32")
 
+
+    # Oturum içi fiyat ve indirim karşılaştırmaları
     if "selling_price" in df.columns:
+        # Oturumdaki ortalama fiyata göre ne kadar pahalı/ucuz
         sess_mean_price = df.groupby("session_id")["selling_price"].transform("mean")
         df["price_vs_session_mean"] = (df["selling_price"] / (sess_mean_price + 1e-6)).astype("float32")
 
+        # Oturumdaki en ucuz ürün mü?
+        df["is_cheapest_in_session"] = (df["selling_price"] == df.groupby("session_id")["selling_price"].transform("min")).astype("int8")
+
     if "discount_pct" in df.columns:
+        # Oturumdaki en yüksek indirimli ürün mü?
         df["is_highest_discount"] = (df["discount_pct"] == df.groupby("session_id")["discount_pct"].transform("max")).astype("int8")
 
     if "rating_avg" in df.columns:
+        # Oturumdaki en yüksek puanlı ürün mü?
         df["is_highest_rating"] = (df["rating_avg"] == df.groupby("session_id")["rating_avg"].transform("max")).astype("int8")
 
+    # Arama terimi uzunluğu (genel vs. spesifik arama sinyali)
+    if "search_term_normalized" in df.columns:
+        df["term_length"] = df["search_term_normalized"].str.len().astype("float32")
+
+    # --- YENİ ÖZELLİKLERİN SONU ---
     return df
 
-# ---------------------- TA baseline ----------------------
+
+# ---------------------- basit TA baseline ----------------------
 def score_timeaware_baseline(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["pred_click"] = 0.65*out.get("tc_ctr_7d", 0) + 0.35*out.get("tc_ctr_30d", 0)
@@ -718,16 +668,14 @@ def normalize_in_session(df: pd.DataFrame, score_col="pred_final") -> pd.DataFra
     out[score_col] = (out[score_col] - grp.transform("min")) / (grp.transform("max") - grp.transform("min") + 1e-8)
     return out
 
-# ---------------------- yardımcılar ----------------------
-LABEL_COLS = {"clicked","ordered","added_to_cart","added_to_fav"}
-ID_COLS    = {"session_id","content_id_hashed","ts_hour","session_date","search_term_normalized","user_id_hashed"}
 
-def build_relevance(df: pd.DataFrame) -> pd.Series:
-    o = df.get("ordered", 0).fillna(0).astype(int)
-    c = df.get("clicked", 0).fillna(0).astype(int)
-    a = df.get("added_to_cart", 0).fillna(0).astype(int)
-    f = df.get("added_to_fav", 0).fillna(0).astype(int)
-    return (4*o + 3*a + 2*f + 1*c).astype("int32")
+# ---------------------- yardımcılar: feature list / split ----------------------
+# BUNU GÜNCELLE
+LABEL_COLS = {"clicked", "ordered", "added_to_cart", "added_to_fav"}  # << eklendi
+ID_COLS = {
+    "session_id", "content_id_hashed", "ts_hour", "session_date",
+    "search_term_normalized", "user_id_hashed"
+}
 
 
 def _feature_cols(df: pd.DataFrame) -> list:
@@ -737,98 +685,81 @@ def _feature_cols(df: pd.DataFrame) -> list:
         if pd.api.types.is_numeric_dtype(df[c]): cols.append(c)
     return cols
 
-def split_time_holdout(df: pd.DataFrame, holdout_days=7):
-    print("[SPLIT] Using session-time 80/20 holdout...")
-    session_times = df[["session_id","ts_hour"]].groupby("session_id")["ts_hour"].min().sort_values()
+def split_time_holdout(df: pd.DataFrame, holdout_days=7, fallback_q=0.8):
+    """
+    Zamana göre sıralı oturumların son %20'sini validasyon olarak ayıran
+    daha güvenilir bir ayırma fonksiyonu.
+    """
+    print("[SPLIT] Using robust session-based time holdout (last 20%)...")
+    
+    # Oturumları ilk görülme zamanına göre sırala
+    session_times = df[["session_id", "ts_hour"]].groupby("session_id")["ts_hour"].min().sort_values()
+    
+    # Oturumların son %20'sini validasyon için seç
     num_sessions = len(session_times)
-    split_idx = int(num_sessions * 0.80)
+    split_idx = int(num_sessions * 0.80) # İlk %80'i train için
+    
     train_session_ids = set(session_times.index[:split_idx])
     valid_session_ids = set(session_times.index[split_idx:])
+    
     tr = df[df["session_id"].isin(train_session_ids)].copy()
     va = df[df["session_id"].isin(valid_session_ids)].copy()
-    print(f"[SPLIT] Done. train={len(tr):,} rows ({len(train_session_ids):,} sessions) | valid={len(va):,} rows ({len(valid_session_ids):,} sessions)")
-    if len(tr)==0 or len(va)==0: raise ValueError("Train/valid boş! Veri tutarlılığını kontrol edin.")
+    
+    print(f"[SPLIT] Done. train={len(tr):,} rows ({len(train_session_ids):,} sessions) | "
+          f"valid={len(va):,} rows ({len(valid_session_ids):,} sessions)")
+    
+    if len(tr) == 0 or len(va) == 0:
+        raise ValueError("Train or validation split is empty! Check data integrity.")
+        
     return tr, va
+
 
 # ---------------------- LTR (LightGBM LambdaRank) ----------------------
 def _callbacks():
-    return [lgb.early_stopping(stopping_rounds=300, verbose=True),
+    return [lgb.early_stopping(stopping_rounds=400, verbose=True),
             lgb.log_evaluation(period=100)]
 
 def _group_counts(df: pd.DataFrame) -> np.ndarray:
     return df.groupby("session_id").size().astype(int).values
 
-def _sort_for_grouping(df: pd.DataFrame) -> pd.DataFrame:
-    return df.sort_values(["session_id","ts_hour","content_id_hashed"]).reset_index(drop=True)
-
-def train_ltr_models(tr: pd.DataFrame, va: pd.DataFrame, feat_cols: list):
-    # *** KRİTİK: LightGBM grup sırası için session bloklarına göre sırala
-    tr = _sort_for_grouping(tr)
-    va = _sort_for_grouping(va)
-
-    # CLICK modeli
-    dtr_click = lgb.Dataset(
-        tr[feat_cols], label=tr["clicked"].astype(int), group=_group_counts(tr)
-    )
-    dva_click = lgb.Dataset(
-        va[feat_cols], label=va["clicked"].astype(int), group=_group_counts(va)
-    )
+def train_ltr_models(tr: pd.DataFrame, feat_cols: list): # <-- Artık 'va' parametresi almıyor
+    # Click modeli
+    print("[TRAIN] Training LTR Click model on full data...")
+    dtr_click = lgb.Dataset(tr[feat_cols], label=tr["clicked"].astype(int), group=_group_counts(tr))
     params_click = {
-        "objective": "lambdarank",
-        "metric": "ndcg",
-        "eval_at": [5, 10, 20, 100],
-        "boosting": "gbdt",
-        "learning_rate": 0.03,
-        "num_leaves": 95,
-        "max_depth": -1,
-        "min_data_in_leaf": 60,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 1,
-        "verbose": -1,
-        "seed": 42,
-        # deterministik + thread kontrol
-        "num_threads": os.cpu_count(),
-        "deterministic": True,
-        "force_row_wise": True,  # bazı sürümlerde determinism'e yardım eder
+        "objective": "lambdarank", "metric": "ndcg", "eval_at": [5, 10, 20, 100],
+        "boosting": "gbdt", "learning_rate": 0.015, "num_leaves": 64, "max_depth": 7,
+        "min_data_in_leaf": 100, "feature_fraction": 0.7, "bagging_fraction": 0.7,
+        "bagging_freq": 1, "verbose": -1, "seed": 42,
     }
-    m_click = lgb.train(
-        params_click, dtr_click, num_boost_round=6000,
-        valid_sets=[dtr_click, dva_click], valid_names=["train", "valid"],
-        callbacks=_callbacks()
-    )
+    # Early stopping olmadan, validasyonda bulunan en iyi iterasyonun biraz fazlasını kullanıyoruz (örn: 256 -> 300)
+    m_click = lgb.train(params_click, dtr_click, num_boost_round=300) # <-- Değişti
 
-    # ORDER modeli (paramlar aynı)
-    dtr_order = lgb.Dataset(
-        tr[feat_cols], label=tr["ordered"].astype(int), group=_group_counts(tr)
-    )
-    dva_order = lgb.Dataset(
-        va[feat_cols], label=va["ordered"].astype(int), group=_group_counts(va)
-    )
-    params_order = params_click.copy()
-    m_order = lgb.train(
-        params_order, dtr_order, num_boost_round=6000,
-        valid_sets=[dtr_order, dva_order], valid_names=["train", "valid"],
-        callbacks=_callbacks()
-    )
-
+    # Order modeli
+    print("[TRAIN] Training LTR Order model on full data...")
+    dtr_order = lgb.Dataset(tr[feat_cols], label=tr["ordered"].astype(int), group=_group_counts(tr))
+    params_order = {
+        "objective": "lambdarank", "metric": "ndcg", "eval_at": [5, 10, 20, 100],
+        "boosting": "gbdt", "learning_rate": 0.015, "num_leaves": 128, "max_depth": 8,
+        "min_data_in_leaf": 80, "feature_fraction": 0.8, "bagging_fraction": 0.8,
+        "bagging_freq": 1, "verbose": -1, "seed": 42,
+    }
+    # Validasyonda bulunan en iyi iterasyonun biraz fazlasını kullanıyoruz (örn: 166 -> 200)
+    m_order = lgb.train(params_order, dtr_order, num_boost_round=200) # <-- Değişti
+    
     return m_click, m_order
-
-def ensure_feature_columns(df: pd.DataFrame, feat_cols: list) -> pd.DataFrame:
-    out = df.copy()
-    for c in feat_cols:
-        if c not in out.columns: out[c] = 0.0
-    return out[feat_cols]
 
 def predict_rank_lgb(df: pd.DataFrame, model: lgb.Booster) -> np.ndarray:
     feat_cols = list(model.feature_name())
-    X = ensure_feature_columns(df, feat_cols)
+    X = ensure_feature_columns(df, feat_cols)  # << eksikler 0.0 ile tamamlanır
     return model.predict(X, num_iteration=getattr(model, "best_iteration", None))
+
 
 def save_lgb(model: lgb.Booster, path:str): model.save_model(path)
 def load_lgb(path:str) -> lgb.Booster: return lgb.Booster(model_file=path)
 
-# ---------------------- XGBoost Ranker (opsiyonel) ----------------------
+
+# ---------------------- XGBoost Ranker ----------------------
 def get_numeric_feature_cols(df: pd.DataFrame) -> list:
     cols = []
     for c in df.columns:
@@ -839,9 +770,34 @@ def get_numeric_feature_cols(df: pd.DataFrame) -> list:
 def to_float32(df: pd.DataFrame, cols: list) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
-        if c in out.columns: out[c] = out[c].astype("float32")
-        else: out[c] = np.float32(0.0)
+        if c in out.columns:
+            out[c] = out[c].astype("float32")
+        else:
+            # modele beklenen ama DF'te olmayan feature'ları 0.0 ile oluştur
+            out[c] = np.float32(0.0)
     return out
+
+
+def ensure_feature_columns(df: pd.DataFrame, feat_cols: list) -> pd.DataFrame:
+    """Modelin beklediği her feature sütunu DataFrame’de varsa kullan, yoksa 0.0 ile oluştur."""
+    out = df.copy()
+    for c in feat_cols:
+        if c not in out.columns:
+            out[c] = 0.0
+    # fazladan kolonlar model tarafından okunmaz; sadece sırayı sabitliyoruz
+    return out[feat_cols]
+
+
+def build_relevance(df: pd.DataFrame) -> pd.Series:
+    o = df.get("ordered", 0).fillna(0).astype(int)
+    c = df.get("clicked", 0).fillna(0).astype(int)
+    # Sadece order ve click kullan, order'a ÇOK daha fazla önem ver
+    # Önceki: 4*o + 3*a + 2*f + 1*c
+    # Yeni:
+    rel = (10 * o + 1 * c).astype("int32") 
+    return pd.Series(rel, index=df.index)
+
+
 
 def make_group_sizes(df: pd.DataFrame) -> np.ndarray:
     return df.groupby("session_id").size().values.astype(int)
@@ -850,48 +806,42 @@ def map_group_ids(df: pd.DataFrame) -> np.ndarray:
     sid = df["session_id"].astype("category").cat.codes.values
     return sid.astype(np.int32)
 
+# BU FONKSİYONU GÜNCELLE
 def run_train_xgb():
-    global args
     assert XGBRanker is not None, "xgboost kurulu değil: pip install xgboost"
     print("[TIMER] XGBRanker train ...")
     train = load_train_sessions()
     feats = assemble_timeaware_features(train, windows=(7, 30, 60))
     feat_cols = get_numeric_feature_cols(feats)
-    tr, va = split_time_holdout(feats, holdout_days=7)
-    if args.use_rel if 'args' in globals() else False:
-        y_tr = build_relevance(tr).values
-        y_va = build_relevance(va).values
-    else:
-        y_tr = tr["ordered"].values
-        y_va = va["ordered"].values
 
+    print("[TRAIN] Using FULL training data for XGBRanker...")
+    tr = feats
+
+    y_tr = build_relevance(tr).values
     X_tr = to_float32(tr, feat_cols)[feat_cols].values
-    X_va = to_float32(va, feat_cols)[feat_cols].values
-    group_tr, group_va = make_group_sizes(tr), make_group_sizes(va)
+    group_tr = make_group_sizes(tr)
+
+    # va ile ilgili tüm değişkenler silindi (y_va, X_va, group_va)
+
     ranker = XGBRanker(
         objective="rank:ndcg",
         eval_metric=["ndcg@5","ndcg@10","ndcg@100"],
-        tree_method="hist",
-        max_depth=8, n_estimators=2400, learning_rate=0.055,
-        subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=0.0, reg_lambda=1.0,
-        n_jobs=os.cpu_count(),
-        random_state=42
+        tree_method="hist", max_depth=8, n_estimators=1000, # <-- n_estimators'ı düşürdüm (2400 çok uzun sürebilir)
+        learning_rate=0.055, subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.0, reg_lambda=1.0, random_state=42,
     )
-    ranker.fit(X_tr, y_tr, group=group_tr.tolist(),
-               eval_set=[(X_va, y_va)], eval_group=[group_va.tolist()],
-               verbose=True, early_stopping_rounds=400)
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    ranker.save_model(os.path.join(MODELS_DIR,"xgb_rank.json"))
-    pd.Series(feat_cols).to_csv(os.path.join(MODELS_DIR,"xgb_rank_features.txt"), index=False, header=False)
-    try:
-        s = ranker.get_booster().get_score(importance_type="gain")
-        imp = pd.DataFrame({"feature": list(s.keys()), "gain": list(s.values())})
-        imp.sort_values("gain", ascending=False).to_csv(os.path.join("outputs","imp_xgb.csv"), index=False)
-    except Exception as e:
-        print(f"[WARN] XGB importance alınamadı: {e}")
+    
+    # .fit() çağrısından validasyon parametrelerini kaldır
+    ranker.fit(
+        X_tr, y_tr,
+        group=group_tr.tolist(),
+        verbose=100 # <-- Sadece ilerlemeyi görmek için verbose=100 yaptım
+    ) # <-- eval_set, eval_group, early_stopping_rounds SİLİNDİ
 
-    print("[XGB] model saved")
+    os.makedirs("models", exist_ok=True)
+    ranker.save_model("models/xgb_rank.json")
+    pd.Series(feat_cols).to_csv("models/xgb_rank_features.txt", index=False, header=False)
+    print("[XGB] model saved -> models/xgb_rank.json & xgb_rank_features.txt")
     print("[TIMER] XGBRanker train done")
 
 def run_infer_xgb(out_path: str):
@@ -899,59 +849,90 @@ def run_infer_xgb(out_path: str):
     print("[TIMER] XGBRanker infer ...")
     test = load_test_sessions()
     feats_te = assemble_timeaware_features(test, windows=(7, 30, 60))
-    feat_cols = pd.read_csv(os.path.join(MODELS_DIR,"xgb_rank_features.txt"), header=None).iloc[:,0].tolist()
+
+    feat_cols = pd.read_csv("models/xgb_rank_features.txt", header=None).iloc[:,0].tolist()
     X_te = to_float32(ensure_feature_columns(feats_te, feat_cols), feat_cols).values
-    model = XGBRanker(); model.load_model(os.path.join(MODELS_DIR,"xgb_rank.json"))
+
+    model = XGBRanker()
+    model.load_model("models/xgb_rank.json")
     preds = model.predict(X_te)
+
     out = feats_te[["session_id","content_id_hashed"]].copy()
     out["pred_final"] = preds.astype("float32")
     out = normalize_in_session(out, "pred_final")
+
     idx = load_sample_submission_session_ids(os.path.join(DATA_DIR, "sample_submission.csv"))
     make_submission(out, out_path, session_index=idx)
     print("[TIMER] XGBRanker infer done")
 
-# ---------------------- CatBoost YetiRank (opsiyonel) ----------------------
+
+# ---------------------- CatBoost YetiRank ----------------------
+# BU FONKSİYONU GÜNCELLE
 def run_train_cat():
-    global args
     assert CatBoostRanker is not None, "catboost kurulu değil: pip install catboost"
     print("[TIMER] CatBoost YetiRank train ...")
     train = load_train_sessions()
     feats = assemble_timeaware_features(train, windows=(7, 30, 60))
     feat_cols = get_numeric_feature_cols(feats)
-    tr, va = split_time_holdout(feats, holdout_days=7)
-    tr = _sort_for_grouping(tr); va = _sort_for_grouping(va)
-    X_tr = to_float32(ensure_feature_columns(tr, feat_cols), feat_cols)
-    X_va = to_float32(ensure_feature_columns(va, feat_cols), feat_cols)
-    if args.use_rel:
-        y_tr = build_relevance(tr).values
-        y_va = build_relevance(va).values
-    else:
-        y_tr = tr["ordered"].values
-        y_va = va["ordered"].values
 
-    grp_tr, grp_va = tr["session_id"].astype(str).values, va["session_id"].astype(str).values
+    print("[TRAIN] Using FULL training data for CatBoost...")
+    tr = feats
+    tr = _sort_for_grouping(tr)
+    
+    # va ile ilgili tüm değişkenler ve kodlar silindi
+
+    X_tr = to_float32(ensure_feature_columns(tr, feat_cols), feat_cols)
+    y_tr = build_relevance(tr).values
+    grp_tr = tr["session_id"].astype(str).values
     train_pool = Pool(X_tr, label=y_tr, group_id=grp_tr)
-    valid_pool = Pool(X_va, label=y_va, group_id=grp_va)
+    
+    # valid_pool silindi
+
     model = CatBoostRanker(
-        loss_function="YetiRank", eval_metric="NDCG:top=10",
-        iterations=4000, learning_rate=0.05, depth=8, l2_leaf_reg=3.0,
+        loss_function="YetiRank",
+        # eval_metric'in bir anlamı kalmadı ama hata vermez
+        eval_metric="NDCG:top=10",
+        iterations=1500, # <-- Validasyonda 1218'de durmuştu, biraz daha fazla eğitelim
+        learning_rate=0.05, depth=8, l2_leaf_reg=3.0,
         random_strength=1.0, bootstrap_type="Bayesian",
-        od_type="Iter", od_wait=400, verbose=100,
-        thread_count=os.cpu_count(),
-        random_seed=42,
+        verbose=100, random_seed=42,
+        # od_type ve od_wait validasyon gerektirdiği için SİLİNDİ
     )
-    model.fit(train_pool, eval_set=valid_pool, use_best_model=True)
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    model.save_model(os.path.join(MODELS_DIR,"cb_rank.cbm"))
-    pd.Series(feat_cols).to_csv(os.path.join(MODELS_DIR,"cb_rank_features.txt"), index=False, header=False)
-    try:
-        imp_vals = model.get_feature_importance(type="FeatureImportance")
-        imp = pd.DataFrame({"feature": feat_cols, "importance": imp_vals})
-        imp.sort_values("importance", ascending=False).to_csv(os.path.join("outputs","imp_cb.csv"), index=False)
-    except Exception as e:
-        print(f"[WARN] CatBoost importance alınamadı: {e}")
-    print("[CatBoost] model saved")
+
+    # .fit() çağrısından validasyon parametrelerini kaldır
+    model.fit(train_pool) # <-- eval_set ve use_best_model SİLİNDİ
+    
+    os.makedirs("models", exist_ok=True)
+    model.save_model("models/cb_rank.cbm")
+    pd.Series(feat_cols).to_csv("models/cb_rank_features.txt", index=False, header=False)
+    print("[CatBoost] model saved -> models/cb_rank.cbm & cb_rank_features.txt")
     print("[TIMER] CatBoost YetiRank train done")
+
+
+def make_submission(scored: pd.DataFrame, out_path: str,
+                    session_index: pd.Series | None = None,
+                    expected_sessions: int | None = None):
+    key = ["session_id","content_id_hashed"]
+    # sadece kandidat set + tekille
+    scored = scored[key + ["pred_final"]].drop_duplicates(key)
+    # her session kendi skoruna göre sırala (kırpma yok, padding yok)
+    sub = (scored.sort_values(["session_id","pred_final"], ascending=[True, False])
+                 .groupby("session_id")["content_id_hashed"]
+                 .apply(lambda x: " ".join(x.astype(str))).reset_index())
+    sub.columns = ["session_id","prediction"]
+    sub["session_id"] = sub["session_id"].astype(str)
+
+    if session_index is not None:
+        sub = session_index.to_frame().merge(sub, on="session_id", how="left").fillna({"prediction": ""})
+    if expected_sessions is not None:
+        assert sub.shape[0] == expected_sessions
+
+    sub.to_csv(out_path, index=False)
+    print(f"[OK] Submission written -> {out_path} (rows={len(sub):,})")
+
+
+def _sort_for_grouping(df: pd.DataFrame) -> pd.DataFrame:
+    return df.sort_values(["session_id","ts_hour","content_id_hashed"]).reset_index(drop=True)
 
 def run_infer_cat(out_path: str):
     assert CatBoostRanker is not None, "catboost kurulu değil: pip install catboost"
@@ -959,20 +940,27 @@ def run_infer_cat(out_path: str):
     test = load_test_sessions()
     feats_te = assemble_timeaware_features(test, windows=(7, 30, 60))
     df = _sort_for_grouping(feats_te)
-    feat_cols = pd.read_csv(os.path.join(MODELS_DIR,"cb_rank_features.txt"), header=None).iloc[:,0].tolist()
+
+    feat_cols = pd.read_csv("models/cb_rank_features.txt", header=None).iloc[:,0].tolist()
     X_te = to_float32(ensure_feature_columns(df, feat_cols), feat_cols)
     grp_te = df["session_id"].astype(str).values
-    model = CatBoostRanker(); model.load_model(os.path.join(MODELS_DIR,"cb_rank.cbm"))
-    preds = model.predict(Pool(X_te, group_id=grp_te))
+    pool_te = Pool(X_te, group_id=grp_te)
+
+    model = CatBoostRanker()
+    model.load_model("models/cb_rank.cbm")
+    preds = model.predict(pool_te)
+
     out = df[["session_id","content_id_hashed"]].copy()
     out["pred_final"] = preds.astype("float32")
     out = normalize_in_session(out, "pred_final")
+
     idx = load_sample_submission_session_ids(os.path.join(DATA_DIR, "sample_submission.csv"))
     make_submission(out, out_path, session_index=idx)
     print("[TIMER] CatBoost YetiRank infer done")
 
-# --- METRICS: MAP@K ve NDCG@K ---
+# --- METRICS: MAP@K ve NDCG@K (tam yarışma formatı) ---
 def _dcg_at_k(rels, k=100):
+    import numpy as np
     rels = np.asfarray(rels)[:k]
     if rels.size == 0: return 0.0
     discounts = 1.0 / np.log2(np.arange(2, rels.size + 2))
@@ -983,7 +971,7 @@ def ndcg_grouped(df: pd.DataFrame, label_col="ordered", score_col="pred_final", 
     for _, g in df.groupby("session_id", sort=False):
         g = g.sort_values(score_col, ascending=False)
         rels = g[label_col].values
-        if (rels > 0).sum() == 0:  # hiç pozitif yoksa dahil etme
+        if (rels > 0).sum() == 0:  # hiç pozitif yoksa oturumu skordan hariç tut
             continue
         dcg = _dcg_at_k(rels, k)
         ideal = np.sort(rels)[::-1]
@@ -996,7 +984,8 @@ def mapk_grouped(df: pd.DataFrame, label_col="ordered", score_col="pred_final", 
     for _, g in df.groupby("session_id", sort=False):
         g = g.sort_values(score_col, ascending=False)
         rels = (g[label_col].values > 0).astype(int)
-        if rels.sum() == 0: continue
+        if rels.sum() == 0:  # hiç pozitif yoksa oturumu skordan hariç tut
+            continue
         hits = 0; ap = 0.0; n = min(k, len(rels))
         for i in range(n):
             if rels[i]:
@@ -1006,73 +995,16 @@ def mapk_grouped(df: pd.DataFrame, label_col="ordered", score_col="pred_final", 
         vals.append(ap)
     return float(np.mean(vals)) if vals else 0.0
 
-def group_auc_weighted(df: pd.DataFrame, score_col="pred_final",
-                       w_order: float = 0.7, w_click: float = 0.3):
-    """
-    Yarışma kurgusuna paralel: her session için ayrı ayrı AUC hesaplar.
-    - click AUC: clicked label'ı olan (0/1) ve her iki sınıfı da içeren oturumlar
-    - order AUC: ordered label'ı olan ve her iki sınıfı da içeren oturumlar
-    Sonra ortalamaları alır, w_order ve w_click ile ağırlıklar.
-    """
-    auc_clicks, auc_orders = [], []
-    for _, g in df.groupby("session_id", sort=False):
-        # CLICK
-        if "clicked" in g and g["clicked"].nunique() > 1:
-            try:
-                auc_clicks.append(roc_auc_score(g["clicked"].values, g[score_col].values))
-            except Exception:
-                pass
-        # ORDER
-        if "ordered" in g and g["ordered"].nunique() > 1:
-            try:
-                auc_orders.append(roc_auc_score(g["ordered"].values, g[score_col].values))
-            except Exception:
-                pass
-    click_auc = float(np.mean(auc_clicks)) if auc_clicks else 0.0
-    order_auc = float(np.mean(auc_orders)) if auc_orders else 0.0
-    final = w_order * order_auc + w_click * click_auc
-    return final, click_auc, order_auc, len(auc_clicks), len(auc_orders)
 
-
-# --- rank 0..1 (oturum içi) ---
+# --- RANK-AVERAGE BLEND: skoru değil oturum içi sırayı karıştır ---
 def _rank01_in_session(df: pd.DataFrame, col: str) -> pd.Series:
     r = df.groupby("session_id")[col].rank(method="first", ascending=False)
     n = df.groupby("session_id")[col].transform("count")
     return (n - r) / (n - 1 + 1e-9)  # 1=best, 0=worst
 
-# ---------------------- submission yardımcıları ----------------------
-def make_submission(scored: pd.DataFrame, out_path: str,
-                    session_index: pd.Series | None = None,
-                    expected_sessions: int | None = None):
-    key = ["session_id","content_id_hashed"]
-    scored = scored[key + ["pred_final"]].drop_duplicates(key)
-    sub = (scored.sort_values(["session_id","pred_final"], ascending=[True, False])
-                 .groupby("session_id")["content_id_hashed"]
-                 .apply(lambda x: " ".join(x.astype(str))).reset_index())
-    sub.columns = ["session_id","prediction"]
-    sub["session_id"] = sub["session_id"].astype(str)
-    if session_index is not None:
-        sub = session_index.to_frame().merge(sub, on="session_id", how="left").fillna({"prediction": ""})
-    if expected_sessions is not None:
-        assert sub.shape[0] == expected_sessions
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    sub.to_csv(out_path, index=False)
-    print(f"[OK] Submission written -> {out_path} (rows={len(sub):,})")
-
-def validate_submission(sub_path: str, sample_path: str):
-    sub = pd.read_csv(sub_path)
-    ss  = pd.read_csv(sample_path, usecols=["session_id"])
-    ok_rows = (len(sub) == len(ss))
-    merged = ss.merge(sub, on="session_id", how="left")
-    missing = merged["prediction"].isna().sum()
-    dup_sessions = sub["session_id"].duplicated().sum()
-    print(f"[CHECK] row_count_match={ok_rows} | missing_sessions={missing} | dup_sessions={dup_sessions}")
-    if not ok_rows or missing or dup_sessions:
-        print("[CHECK] Örnek problemli satırlar:")
-        print(merged[merged["prediction"].isna()].head())
 
 
-# ---------------------- Runnner'lar ----------------------
+# ---------------------- runner'lar ----------------------
 def run_baseline_timeaware(out_path: str):
     set_seed(42)
     with timer("baseline_timeaware"):
@@ -1092,41 +1024,42 @@ def run_baseline_timeaware(out_path: str):
         make_submission(scored_te[["session_id","content_id_hashed","pred_final"]],
                         out_path, session_index=idx)
 
-def run_train_ltr(alpha: float):
+def run_train_ltr(alpha: float): # alpha artık kullanılmıyor ama uyumluluk için kalsın
     set_seed(42)
     with timer("LTR train"):
         train = load_train_sessions()
         feats = assemble_timeaware_features(train, windows=(7,30,60))
         feat_cols = _feature_cols(feats)
-        tr, va = split_time_holdout(feats, holdout_days=7)
-        m_click, m_order = train_ltr_models(tr, va, feat_cols)
+        
+        print("[TRAIN] Using FULL training data for LTR...")
+        tr = feats
+        
+        # Validasyon seti olmadığı için 'va' olmadan çağırıyoruz
+        m_click, m_order = train_ltr_models(tr, feat_cols) # <-- Değişti
 
-        # alpha taramasını gerçek metrikle logla
-        for a in [0.70,0.74,0.78,0.80,0.82,0.85]:
-            tmp = va.copy()
-            tmp["pred_click"] = predict_rank_lgb(tmp, m_click)
-            tmp["pred_order"] = predict_rank_lgb(tmp, m_order)
-            tmp["pred_final"] = (1-a)*tmp["pred_click"] + a*tmp["pred_order"]
-            tmp = normalize_in_session(tmp, "pred_final")
-            score = ndcg_grouped(tmp, label_col="ordered", score_col="pred_final", k=100)
-            print(f"[ALPHA] a={a:.2f} NDCG@100={score:.6f}")
+        # Validasyon seti olmadığı için alpha taraması yapılamaz. Bu döngüyü SİL.
+        # for a in [0.70, ...]: # <-- BU BLOK TAMAMEN SİLİNECEK
 
         save_lgb(m_click, os.path.join(MODELS_DIR,"lgb_click.txt"))
         save_lgb(m_order, os.path.join(MODELS_DIR,"lgb_order.txt"))
         print("[LTR] models saved.")
+
 
 def run_infer_ltr(out_path: str, alpha: float):
     set_seed(42)
     with timer("LTR infer"):
         test = load_test_sessions()
         feats_te = assemble_timeaware_features(test, windows=(7,30,60))
+
         m_click = load_lgb(os.path.join(MODELS_DIR,"lgb_click.txt"))
         m_order = load_lgb(os.path.join(MODELS_DIR,"lgb_order.txt"))
+
         df = feats_te.copy()
         df["pred_click"] = predict_rank_lgb(df, m_click)
         df["pred_order"] = predict_rank_lgb(df, m_order)
         df["pred_final"] = (1-alpha)*df["pred_click"] + alpha*df["pred_order"]
         df = normalize_in_session(df, "pred_final")
+
         idx = load_sample_submission_session_ids()
         make_submission(df[["session_id","content_id_hashed","pred_final"]],
                         out_path, session_index=idx)
@@ -1155,7 +1088,6 @@ def run_infer_blend(out_path: str, alpha: float, beta: float):
         # blend
         df = ltr.merge(ta, on=["session_id","content_id_hashed"], how="inner")
         df["pred_final"] = (1-beta)*df["pred_ltr"] + beta*df["pred_ta"]
-        df = normalize_in_session(df, "pred_final")
 
         idx = load_sample_submission_session_ids()
         make_submission(df[["session_id","content_id_hashed","pred_final"]],
@@ -1168,8 +1100,10 @@ def run_infer_ensemble(out_path: str,
                        w_cb:  float = 0.25,
                        w_ta:  float = 0.15):
     print("[TIMER] Ensemble infer ...")
+    # ağırlıkları normalize et
     ws = np.array([w_ltr, w_xgb, w_cb, w_ta], dtype="float64")
-    if ws.sum() <= 0: ws = np.array([1.0, 0.0, 0.0, 0.0])
+    if ws.sum() <= 0:
+        ws = np.array([1.0, 0.0, 0.0, 0.0])
     ws = ws / ws.sum()
     w_ltr, w_xgb, w_cb, w_ta = ws.tolist()
 
@@ -1178,7 +1112,7 @@ def run_infer_ensemble(out_path: str,
     feats_te = feats_te.sort_values(["session_id","ts_hour","content_id_hashed"]).reset_index(drop=True)
     key = ["session_id","content_id_hashed"]
 
-    # LTR
+    # LTR skorları
     try:
         m_click = load_lgb(os.path.join(MODELS_DIR,"lgb_click.txt"))
         m_order = load_lgb(os.path.join(MODELS_DIR,"lgb_order.txt"))
@@ -1191,46 +1125,56 @@ def run_infer_ensemble(out_path: str,
         print(f"[WARN] LTR yüklenemedi: {e}")
         ltr = feats_te[key].copy(); ltr["pred_ltr"] = 0.0
 
-    # XGB
+    # XGB skorları
     try:
-        xgb_feat_cols = pd.read_csv(os.path.join(MODELS_DIR,"xgb_rank_features.txt"), header=None).iloc[:,0].tolist()
-        xgb_model = XGBRanker(); xgb_model.load_model(os.path.join(MODELS_DIR,"xgb_rank.json"))
+        xgb_feat_cols = pd.read_csv("models/xgb_rank_features.txt", header=None).iloc[:,0].tolist()
+        xgb_model = XGBRanker(); xgb_model.load_model("models/xgb_rank.json")
+
         fe_mat = to_float32(ensure_feature_columns(feats_te, xgb_feat_cols), xgb_feat_cols)
         preds_xgb = xgb_model.predict(fe_mat.values)
+
         xgb_df = feats_te[key].copy()
         xgb_df["pred_xgb"] = preds_xgb.astype("float32")
         xgb_df = normalize_in_session(xgb_df, "pred_xgb")[key+["pred_xgb"]]
+
     except Exception as e:
         print(f"[WARN] XGB yüklenemedi: {e}")
         xgb_df = feats_te[key].copy(); xgb_df["pred_xgb"] = 0.0
 
-    # CatBoost
+    # CatBoost skorları
     try:
-        cb_feat_cols = pd.read_csv(os.path.join(MODELS_DIR,"cb_rank_features.txt"), header=None).iloc[:,0].tolist()
-        X_cb = ensure_feature_columns(to_float32(feats_te, cb_feat_cols), cb_feat_cols)
-        cb_model = CatBoostRanker(); cb_model.load_model(os.path.join(MODELS_DIR,"cb_rank.cbm"))
+        cb_feat_cols = pd.read_csv("models/cb_rank_features.txt", header=None).iloc[:,0].tolist()
+        X_cb = ensure_feature_columns(to_float32(feats_te, cb_feat_cols), cb_feat_cols)  # eksik feature güvence
+        cb_model = CatBoostRanker(); cb_model.load_model("models/cb_rank.cbm")
+
+        X_cb = ensure_feature_columns(to_float32(feats_te, cb_feat_cols), cb_feat_cols)  # eksik feature güvence
         grp_te = map_group_ids(feats_te)
-        preds_cb = cb_model.predict(Pool(X_cb, group_id=grp_te))
+        pool_te = Pool(X_cb, group_id=grp_te)
+        preds_cb = cb_model.predict(pool_te)
+
         cb_df = feats_te[key].copy()
         cb_df["pred_cb"] = preds_cb.astype("float32")
         cb_df = normalize_in_session(cb_df, "pred_cb")[key+["pred_cb"]]
+
     except Exception as e:
         print(f"[WARN] CatBoost yüklenemedi: {e}")
         cb_df = feats_te[key].copy(); cb_df["pred_cb"] = 0.0
 
-    # TA
+    # TA baseline
     ta = score_timeaware_baseline(feats_te)
     ta = normalize_in_session(ta[key + ["pred_final"]].rename(columns={"pred_final":"pred_ta"}), "pred_ta")
 
-    # combine (rank-average)
+    # Birleştir + ağırlıklandır
     df = ltr.merge(xgb_df, on=key, how="left") \
             .merge(cb_df,  on=key, how="left") \
             .merge(ta,     on=key, how="left")
 
+    # rank-average özelliklerine çevir
     for c in ["pred_ltr","pred_xgb","pred_cb","pred_ta"]:
         if c not in df.columns: df[c] = 0.0
         df[c + "_r01"] = _rank01_in_session(df, c)
 
+    # ağırlıklı rank-average
     df["pred_final"] = (
         w_ltr * df["pred_ltr_r01"] +
         w_xgb * df["pred_xgb_r01"] +
@@ -1238,15 +1182,21 @@ def run_infer_ensemble(out_path: str,
         w_ta  * df["pred_ta_r01"]
     ).astype("float32")
 
-    # küçük “tekrar bonusları”
+    # oturum içi sinyalleri getir ve küçük bonus ver
+    # Eksik olabilecek in-session kolonlarını güvenle oluştur
     missing_cols = [
-        "clicked_before_item_sess","added_to_cart_before_item_sess","added_to_fav_before_item_sess",
+        "clicked_before_item_sess",
+        "added_to_cart_before_item_sess",
+        "added_to_fav_before_item_sess",
     ]
     for c in missing_cols:
-        if c not in feats_te.columns: feats_te[c] = 0.0
-    if "seen_before" not in feats_te.columns: feats_te["seen_before"] = 0.0
+        if c not in feats_te.columns:
+            feats_te[c] = 0.0
+    if "seen_before" not in feats_te.columns:
+        feats_te["seen_before"] = 0.0
     sel_cols = key + ["seen_before"] + missing_cols
     feats_te[sel_cols] = feats_te[sel_cols].fillna(0)
+
     df = df.merge(feats_te[sel_cols], on=key, how="left")
 
     df["repeat_bonus"] = (
@@ -1257,21 +1207,57 @@ def run_infer_ensemble(out_path: str,
     ).astype("float32")
 
     df["pred_final"] = (df["pred_final"] + df["repeat_bonus"]).astype("float32")
-    df = normalize_in_session(df, "pred_final")
 
+    df = normalize_in_session(df, "pred_final")  # hafif min-max, opsiyonel
+
+    print("[POST] Applying category matching rerank...")
+    try:
+        # Ürün kategori bilgilerini yükle
+        meta_cat = pd.read_parquet(os.path.join(DATA_DIR, 'content/metadata.parquet'), columns=['content_id_hashed', 'level2_category_name'])
+        meta_cat = meta_cat.dropna(subset=['level2_category_name'])
+        meta_cat['level2_category_name'] = meta_cat['level2_category_name'].str.lower()
+        
+        # Ana DataFrame'e kategori bilgisini ekle
+        df = df.merge(feats_te[['session_id', 'content_id_hashed', 'search_term_normalized']], on=['session_id', 'content_id_hashed'], how='left')
+        df = df.merge(meta_cat, on='content_id_hashed', how='left')
+
+        # Kategori arama teriminde geçiyorsa bonus ver
+        # str.contains yavaş olabilir, bu yüzden apply kullanıyoruz
+        def category_in_term(row):
+            term = row['search_term_normalized']
+            cat = row['level2_category_name']
+            if pd.isna(term) or pd.isna(cat):
+                return False
+            # Kategori adının (genellikle tek kelime) arama teriminde tam kelime olarak geçip geçmediğini kontrol et
+            return f" {cat} " in f" {term} "
+
+        # Bonus sadece eşleşme varsa uygulanır
+        category_bonus = df.apply(category_in_term, axis=1).astype('float32') * 0.10 # Bonus miktarını ayarlayabilirsiniz
+        df['pred_final'] = df['pred_final'] + category_bonus
+        
+        # Normalizasyonu tekrar yapmaya gerek yok, çünkü sadece sıralama önemli
+        print("[POST] Category matching rerank done.")
+    except Exception as e:
+        print(f"[WARN] Category reranking failed: {e}")
+    # --- YENİ KATEGORİ RERANKING SONU ---
+
+    df = normalize_in_session(df, "pred_final")
     idx = load_sample_submission_session_ids(os.path.join(DATA_DIR, "sample_submission.csv"))
     make_submission(df, out_path, session_index=idx)
     print(f"[TIMER] Ensemble infer done (w_ltr={w_ltr:.2f}, w_xgb={w_xgb:.2f}, w_cb={w_cb:.2f}, w_ta={w_ta:.2f})")
 
+
 def run_offline_eval(alpha_ltr: float, w_ltr: float, w_xgb: float, w_cb: float, w_ta: float,
                      metric: str = "ndcg", k: int = 100):
-    print("[TIMER] Offline eval ...]")
+    print("[TIMER] Offline eval ...")
     train = load_train_sessions()
     feats = assemble_timeaware_features(train, windows=(7, 30, 60))
     feats = _sort_for_grouping(feats)
+    key = ["session_id","content_id_hashed"]
+
+    # valid holdout ayır
     tr, va = split_time_holdout(feats, holdout_days=7)
     va = va.copy()
-    key = ["session_id","content_id_hashed"]
 
     # LTR
     try:
@@ -1281,31 +1267,32 @@ def run_offline_eval(alpha_ltr: float, w_ltr: float, w_xgb: float, w_cb: float, 
         va["pred_order"] = predict_rank_lgb(va, m_order)
         va["pred_ltr"]   = (1.0 - alpha_ltr) * va["pred_click"] + alpha_ltr * va["pred_order"]
     except Exception as e:
-        print(f"[WARN] LTR yok: {e}"); va["pred_ltr"] = 0.0
+        print(f"[WARN] LTR yok/yüklenemedi: {e}"); va["pred_ltr"] = 0.0
 
     # XGB
     try:
-        xgb_feat_cols = pd.read_csv(os.path.join(MODELS_DIR,"xgb_rank_features.txt"), header=None).iloc[:,0].tolist()
+        xgb_feat_cols = pd.read_csv("models/xgb_rank_features.txt", header=None).iloc[:,0].tolist()
         X = to_float32(ensure_feature_columns(va, xgb_feat_cols), xgb_feat_cols).values
-        xm = XGBRanker(); xm.load_model(os.path.join(MODELS_DIR,"xgb_rank.json"))
+        xm = XGBRanker(); xm.load_model("models/xgb_rank.json")
         va["pred_xgb"] = xm.predict(X).astype("float32")
     except Exception as e:
-        print(f"[WARN] XGB yok: {e}"); va["pred_xgb"] = 0.0
+        print(f"[WARN] XGB yok/yüklenemedi: {e}"); va["pred_xgb"] = 0.0
 
-    # CB
+    # CatBoost
     try:
-        cb_feat_cols = pd.read_csv(os.path.join(MODELS_DIR,"cb_rank_features.txt"), header=None).iloc[:,0].tolist()
+        cb_feat_cols = pd.read_csv("models/cb_rank_features.txt", header=None).iloc[:,0].tolist()
         Xcb = ensure_feature_columns(to_float32(va, cb_feat_cols), cb_feat_cols)
         grp = map_group_ids(va)
-        cbm = CatBoostRanker(); cbm.load_model(os.path.join(MODELS_DIR,"cb_rank.cbm"))
+        cbm = CatBoostRanker(); cbm.load_model("models/cb_rank.cbm")
         va["pred_cb"] = cbm.predict(Pool(Xcb, group_id=grp)).astype("float32")
     except Exception as e:
-        print(f"[WARN] CB yok: {e}"); va["pred_cb"] = 0.0
+        print(f"[WARN] CatBoost yok/yüklenemedi: {e}"); va["pred_cb"] = 0.0
 
     # TA
     ta = score_timeaware_baseline(va)
     va["pred_ta"] = ta["pred_final"].values
 
+    # rank-average
     for c in ["pred_ltr","pred_xgb","pred_cb","pred_ta"]:
         va[c + "_r01"] = _rank01_in_session(va, c)
     va["pred_final"] = (
@@ -1315,20 +1302,15 @@ def run_offline_eval(alpha_ltr: float, w_ltr: float, w_xgb: float, w_cb: float, 
         w_ta  * va["pred_ta_r01"]
     ).astype("float32")
 
-    metric_l = metric.lower()
-    if metric_l == "map":
+    # metrik: label olarak ORDERED kullan (yarışma LB ile hizalanır)
+    if metric.lower() == "map":
         score = mapk_grouped(va, label_col="ordered", score_col="pred_final", k=k)
         print(f"[OFFLINE] MAP@{k}: {score:.6f}")
-    elif metric_l == "auc":
-        final, click_auc, order_auc, n_click, n_order = group_auc_weighted(va, score_col="pred_final")
-        print(f"[OFFLINE] GroupAUC (weighted) = {final:.6f} | "
-              f"click_auc={click_auc:.6f} (sessions={n_click}) | "
-              f"order_auc={order_auc:.6f} (sessions={n_order})")
     else:
         score = ndcg_grouped(va, label_col="ordered", score_col="pred_final", k=k)
         print(f"[OFFLINE] NDCG@{k}: {score:.6f}")
-
     print("[TIMER] Offline eval done")
+
 
 # ---------------------- CLI ----------------------
 if __name__ == "__main__":
@@ -1338,11 +1320,13 @@ if __name__ == "__main__":
     ap.add_argument("--infer_ltr", action="store_true")
     ap.add_argument("--infer_blend", action="store_true")
 
+    # Ranker eğitim/çıkarsama
     ap.add_argument("--train_xgb", action="store_true", help="XGBoost Ranker eğit")
     ap.add_argument("--infer_xgb", action="store_true", help="XGBoost Ranker infer")
     ap.add_argument("--train_cat", action="store_true", help="CatBoost YetiRank eğit")
     ap.add_argument("--infer_cat", action="store_true", help="CatBoost YetiRank infer")
 
+    # Ensemble
     ap.add_argument("--infer_ensemble", action="store_true", help="LTR+XGB+CB+TA ensemble infer")
     ap.add_argument("--w_ltr", type=float, default=0.50)
     ap.add_argument("--w_xgb", type=float, default=0.25)
@@ -1350,19 +1334,16 @@ if __name__ == "__main__":
     ap.add_argument("--w_ta",  type=float, default=0.15)
 
     ap.add_argument("--offline_eval", action="store_true")
-    ap.add_argument("--metric", type=str, default="ndcg", choices=["ndcg","map","auc"])
+    ap.add_argument("--metric", type=str, default="ndcg", choices=["ndcg","map"])
     ap.add_argument("--k", type=int, default=100)
+
 
     ap.add_argument("--alpha", type=float, default=0.80, help="LTR içi order ağırlığı")
     ap.add_argument("--beta",  type=float, default=0.30, help="Blend ağırlığı: LTR (1-beta) ⊕ TA (beta)")
     ap.add_argument("--out",   type=str, default="outputs/submission.csv")
-    ap.add_argument("--use_rel", action="store_true", help="XGB/CB eğitiminde ordered yerine relevance label kullan")
-    ap.add_argument("--check_sub", type=str, help="Kontrol edilecek submission dosyası yolu")
-
     args = ap.parse_args()
-    if args.check_sub:
-        validate_submission(args.check_sub, os.path.join(DATA_DIR, "sample_submission.csv"))
-    elif args.baseline_timeaware:
+
+    if args.baseline_timeaware:
         run_baseline_timeaware(args.out)
     elif args.train_ltr:
         run_train_ltr(alpha=args.alpha)
@@ -1387,20 +1368,22 @@ if __name__ == "__main__":
             w_cb=args.w_cb,
             w_ta=args.w_ta
         )
+    
     elif args.offline_eval:
         run_offline_eval(
             alpha_ltr=args.alpha,
             w_ltr=args.w_ltr, w_xgb=args.w_xgb, w_cb=args.w_cb, w_ta=args.w_ta,
             metric=args.metric, k=args.k
         )
+
     else:
         print("Örnekler:\n"
-              "  python one_run_v9.py --baseline_timeaware --out outputs/ta.csv\n"
-              "  python one_run_v9.py --train_ltr --alpha 0.80\n"
-              "  python one_run_v9.py --infer_ltr --alpha 0.80 --out outputs/sub_ltr.csv\n"
-              "  python one_run_v9.py --train_xgb\n"
-              "  python one_run_v9.py --infer_xgb --out outputs/sub_xgb.csv\n"
-              "  python one_run_v9.py --train_cat\n"
-              "  python one_run_v9.py --infer_cat --out outputs/sub_cat.csv\n"
-              "  python one_run_v9.py --infer_blend --alpha 0.80 --beta 0.30 --out outputs/sub_blend.csv\n"
-              "  python one_run_v9.py --infer_ensemble --alpha 0.85 --w_ltr 0.70 --w_xgb 0.15 --w_cb 0.15 --w_ta 0.00 --out outputs/sub_ens.csv")
+              "  python one_run.py --baseline_timeaware --out outputs/ta.csv\n"
+              "  python one_run.py --train_ltr --alpha 0.80\n"
+              "  python one_run.py --infer_ltr --alpha 0.80 --out outputs/sub_ltr.csv\n"
+              "  python one_run.py --train_xgb\n"
+              "  python one_run.py --infer_xgb --out outputs/sub_xgb.csv\n"
+              "  python one_run.py --train_cat\n"
+              "  python one_run.py --infer_cat --out outputs/sub_cat.csv\n"
+              "  python one_run.py --infer_blend --alpha 0.80 --beta 0.30 --out outputs/sub_blend.csv\n"
+              "  python one_run.py --infer_ensemble --alpha 0.80 --w_ltr 0.55 --w_xgb 0.20 --w_cb 0.20 --w_ta 0.05 --out outputs/sub_ens.csv")
