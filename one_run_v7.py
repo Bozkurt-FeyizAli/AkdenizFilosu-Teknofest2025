@@ -15,6 +15,7 @@ Komutlar (örnekler en altta):
 import os, time, argparse, numpy as np, pandas as pd
 import duckdb
 import lightgbm as lgb
+import gc
 
 # XGBoost & CatBoost opsiyonel — sistemde yoksa import hatası vermesin
 try:
@@ -138,8 +139,7 @@ def generate_text_similarity_features(df: pd.DataFrame) -> pd.DataFrame:
         emb_dim = term_embeddings.shape[1]
         default_vec = np.zeros(emb_dim, dtype=np.float32)
 
-        term_vecs_np = np.array([v if v is not None else default_vec for v in term_vecs])
-        # Sadece v'nin bir NumPy dizisi (yani geçerli bir vektör) olup olmadığını kontrol et
+        term_vecs_np = np.array([v if isinstance(v, np.ndarray) else default_vec for v in term_vecs])
         content_vecs_np = np.array([v if isinstance(v, np.ndarray) else default_vec for v in content_vecs])
 
         # Cosine similarity hesapla: (a * b).sum() / (||a|| * ||b||)
@@ -1071,28 +1071,96 @@ def run_baseline_timeaware(out_path: str):
         make_submission(scored_te[["session_id","content_id_hashed","pred_final"]],
                         out_path, session_index=idx)
 
+# MEVCUT run_train_ltr FONKSİYONUNU SİLİP BUNU YAPIŞTIRIN
+
+import gc # Belleği temizlemek için garbage collector'ı import ediyoruz
+
 def run_train_ltr(alpha: float):
     set_seed(42)
-    with timer("LTR train"):
-        train = load_train_sessions()
-        feats = assemble_timeaware_features(train, windows=(7,30,60))
+    with timer("LTR train (Chunked Processing)"):
+        
+        # --- Parçalı İşleme Bölümü ---
+        
+        chunk_size = 5_000_000  # Her seferinde işlenecek satır sayısı. RAM'e göre bu değeri ayarlayabilirsiniz.
+        source_file = os.path.join(DATA_DIR, 'train_sessions.parquet')
+        temp_dir = "/kaggle/working/temp_chunks/"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        print(f"Başlatılıyor: '{source_file}' dosyası {chunk_size:,} satırlık parçalar halinde işlenecek.")
+
+        # Parquet dosyasını parça parça okumak için bir 'iterator' kullanıyoruz.
+        try:
+            parquet_iterator = pd.read_parquet(source_file, chunk_size=chunk_size, iterator=True)
+        except TypeError: # Eski pandas versiyonları için
+             parquet_iterator = pd.read_parquet(source_file, engine='pyarrow', chunk_size=chunk_size, iterator=True)
+
+        
+        processed_chunk_paths = [] # İşlenmiş parçaların dosya yollarını tutacak liste
+
+        for i, chunk in enumerate(parquet_iterator):
+            print(f"--- Parça {i+1} işleniyor... ({len(chunk):,} satır) ---")
+            
+            # Her parça için zaman-bağımlı özellikleri hesapla
+            # assemble_timeaware_features zaten harici log dosyalarına baktığı için bu mantık çalışır.
+            processed_chunk = assemble_timeaware_features(chunk, windows=(7, 30, 60))
+            
+            # İşlenmiş parçayı geçici bir dosyaya kaydet
+            temp_path = os.path.join(temp_dir, f'processed_chunk_{i}.parquet')
+            processed_chunk.to_parquet(temp_path)
+            processed_chunk_paths.append(temp_path)
+            
+            # RAM'i boşaltmak için gereksiz nesneleri sil ve çöp toplayıcıyı çağır
+            del chunk
+            del processed_chunk
+            gc.collect()
+            print(f"Parça {i+1} tamamlandı ve '{temp_path}' olarak kaydedildi.")
+        
+        # --- Birleştirme Bölümü ---
+
+        print("\nTüm parçalar işlendi. Şimdi birleştiriliyor...")
+        
+        # İşlenmiş tüm parçaları birleştirerek nihai özellik setini (feats) oluştur
+        feats = pd.concat(
+            [pd.read_parquet(path) for path in processed_chunk_paths], 
+            ignore_index=True
+        )
+        
+        print(f"Birleştirme tamamlandı. Toplam {len(feats):,} satırlık özellik seti oluşturuldu.")
+        
+        # Belleği temizle
+        del processed_chunk_paths
+        gc.collect()
+
+        # --- Orijinal Model Eğitimi Bölümü ---
+        
+        # ÖNEMLİ: In-session özelliklerini TÜM VERİ BİRLEŞTİKTEN SONRA hesaplıyoruz.
+        # Bu, bir oturumun farklı parçalara bölünmesi durumunda bile özelliklerin doğru hesaplanmasını sağlar.
+        print("Tüm veri üzerinden oturum-içi (in-session) özellikler hesaplanıyor...")
+        feats = add_in_session_features(feats)
+        
         feat_cols = _feature_cols(feats)
         tr, va = split_time_holdout(feats, holdout_days=7)
+        
+        # Bellek optimizasyonu için artık ihtiyaç duyulmayan büyük 'feats' DataFrame'ini silebiliriz
+        del feats
+        gc.collect()
+
+        print("\nModel eğitimi başlıyor...")
         m_click, m_order = train_ltr_models(tr, va, feat_cols)
 
-        # hızlı alpha taraması (log amaçlı)
-        for a in [0.70,0.74,0.78,0.80,0.82,0.85]:
+        # Hızlı alpha taraması (log amaçlı)
+        for a in [0.70, 0.74, 0.78, 0.80, 0.82, 0.85]:
             tmp = va.copy()
             tmp["pred_click"] = predict_rank_lgb(tmp, m_click)
             tmp["pred_order"] = predict_rank_lgb(tmp, m_order)
-            tmp["pred_final"] = (1-a)*tmp["pred_click"] + a*tmp["pred_order"]
+            tmp["pred_final"] = (1 - a) * tmp["pred_click"] + a * tmp["pred_order"]
             tmp = normalize_in_session(tmp, "pred_final")
             proxy = tmp.groupby("session_id")["pred_final"].mean().mean()
             print(f"[ALPHA] a={a:.2f} (valid mean score proxy={proxy:.6f})")
 
-        save_lgb(m_click, os.path.join(MODELS_DIR,"lgb_click.txt"))
-        save_lgb(m_order, os.path.join(MODELS_DIR,"lgb_order.txt"))
-        print("[LTR] models saved.")
+        save_lgb(m_click, os.path.join(MODELS_DIR, "lgb_click.txt"))
+        save_lgb(m_order, os.path.join(MODELS_DIR, "lgb_order.txt"))
+        print("[LTR] Modeller kaydedildi.")
 
 
 def run_infer_ltr(out_path: str, alpha: float):

@@ -1137,7 +1137,7 @@ def run_train_ltr(alpha: float):
         
         # --- Parçalı İşleme Bölümü ---
         
-        chunk_size = 300_000  # Her seferinde işlenecek satır sayısı. RAM'e göre artırıp azaltabilirsiniz.
+        chunk_size = 5_000_000  # Her seferinde işlenecek satır sayısı. RAM'e göre artırıp azaltabilirsiniz.
         source_file = os.path.join(DATA_DIR, 'train_sessions.parquet')
         temp_dir = "/kaggle/working/temp_chunks/"
         os.makedirs(temp_dir, exist_ok=True)
