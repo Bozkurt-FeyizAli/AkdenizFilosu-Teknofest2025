@@ -127,7 +127,8 @@ def generate_text_similarity_features(df: pd.DataFrame) -> pd.DataFrame:
             del meta
 
         content_to_emb = {content_id: emb for content_id, emb in zip(unique_contents, content_embeddings)}
-
+        emb_dim = term_embeddings.shape[1]
+        default_vec = np.zeros(emb_dim, dtype=np.float32)
         # --- DataFrame'e Benzerlik Skorunu Ekleme ---
         print("Benzerlik skorları hesaplanıyor...")
         term_vecs = df["search_term_normalized"].map(term_to_emb).tolist()
@@ -138,7 +139,8 @@ def generate_text_similarity_features(df: pd.DataFrame) -> pd.DataFrame:
         default_vec = np.zeros(emb_dim, dtype=np.float32)
 
         term_vecs_np = np.array([v if v is not None else default_vec for v in term_vecs])
-        content_vecs_np = np.array([v if v is not None else default_vec for v in content_vecs])
+        # Sadece v'nin bir NumPy dizisi (yani geçerli bir vektör) olup olmadığını kontrol et
+        content_vecs_np = np.array([v if isinstance(v, np.ndarray) else default_vec for v in content_vecs])
 
         # Cosine similarity hesapla: (a * b).sum() / (||a|| * ||b||)
         # Vektörler zaten normalize edilmiş olabilir ama biz yine de garantileyelim.
