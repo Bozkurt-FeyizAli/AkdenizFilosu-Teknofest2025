@@ -731,6 +731,7 @@ def map_group_ids(df: pd.DataFrame) -> np.ndarray:
     sid = df["session_id"].astype("category").cat.codes.values
     return sid.astype(np.int32)
 
+# BU FONKSİYONU GÜNCELLE
 def run_train_xgb():
     assert XGBRanker is not None, "xgboost kurulu değil: pip install xgboost"
     print("[TIMER] XGBRanker train ...")
@@ -738,38 +739,30 @@ def run_train_xgb():
     feats = assemble_timeaware_features(train, windows=(7, 30, 60))
     feat_cols = get_numeric_feature_cols(feats)
 
-    tr, va = split_time_holdout(feats, holdout_days=7)
+    print("[TRAIN] Using FULL training data for XGBRanker...")
+    tr = feats # <-- TÜM VERİYİ KULLAN
 
     y_tr = build_relevance(tr).values
-    y_va = build_relevance(va).values
     X_tr = to_float32(tr, feat_cols)[feat_cols].values
-    X_va = to_float32(va, feat_cols)[feat_cols].values
-
     group_tr = make_group_sizes(tr)
-    group_va = make_group_sizes(va)
+
+    # va ile ilgili tüm değişkenler silindi
 
     ranker = XGBRanker(
         objective="rank:ndcg",
         eval_metric=["ndcg@5","ndcg@10","ndcg@100"],
-        tree_method="hist",
-        max_depth=8,
-        n_estimators=2400,
-        learning_rate=0.055,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.0,
-        reg_lambda=1.0,
-        random_state=42,
+        tree_method="hist", max_depth=8,
+        n_estimators=500, # <-- early_stopping olmayacağı için sabit bir değer belirliyoruz
+        learning_rate=0.055, subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.0, reg_lambda=1.0, random_state=42,
     )
+    
+    # .fit() çağrısından validasyon parametrelerini kaldır
     ranker.fit(
         X_tr, y_tr,
         group=group_tr.tolist(),
-        eval_set=[(X_va, y_va)],
-        eval_group=[group_va.tolist()],
-        verbose=True,
-        early_stopping_rounds=400,
-    )
-
+        verbose=100
+    ) # <-- eval_set, eval_group, early_stopping_rounds SİLİNDİ
 
     os.makedirs("models", exist_ok=True)
     ranker.save_model("models/xgb_rank.json")
@@ -800,6 +793,7 @@ def run_infer_xgb(out_path: str):
 
 
 # ---------------------- CatBoost YetiRank ----------------------
+# BU FONKSİYONU GÜNCELLE
 def run_train_cat():
     assert CatBoostRanker is not None, "catboost kurulu değil: pip install catboost"
     print("[TIMER] CatBoost YetiRank train ...")
@@ -807,39 +801,31 @@ def run_train_cat():
     feats = assemble_timeaware_features(train, windows=(7, 30, 60))
     feat_cols = get_numeric_feature_cols(feats)
 
-    tr, va = split_time_holdout(feats, holdout_days=7)
+    print("[TRAIN] Using FULL training data for CatBoost...")
+    tr = feats # <-- TÜM VERİYİ KULLAN
     tr = _sort_for_grouping(tr)
-    va = _sort_for_grouping(va)
+    
+    # va ile ilgili tüm değişkenler ve kodlar silindi
 
-    # feature matrisi
     X_tr = to_float32(ensure_feature_columns(tr, feat_cols), feat_cols)
-    X_va = to_float32(ensure_feature_columns(va, feat_cols), feat_cols)
-
-    # label & group (string session_id de verebilirsin)
     y_tr = build_relevance(tr).values
-    y_va = build_relevance(va).values
     grp_tr = tr["session_id"].astype(str).values
-    grp_va = va["session_id"].astype(str).values
-
     train_pool = Pool(X_tr, label=y_tr, group_id=grp_tr)
-    valid_pool = Pool(X_va, label=y_va, group_id=grp_va)
+    
+    # valid_pool silindi
 
     model = CatBoostRanker(
         loss_function="YetiRank",
-        eval_metric="NDCG:top=10",
-        iterations=4000,
-        learning_rate=0.05,
-        depth=8,
-        l2_leaf_reg=3.0,
-        random_strength=1.0,
-        bootstrap_type="Bayesian",
-        od_type="Iter",
-        od_wait=400,
-        verbose=100,
-        random_seed=42,
+        iterations=800, # <-- early_stopping olmayacağı için sabit bir değer belirliyoruz
+        learning_rate=0.05, depth=8, l2_leaf_reg=3.0,
+        random_strength=1.0, bootstrap_type="Bayesian",
+        verbose=100, random_seed=42,
+        # eval_metric, od_type ve od_wait SİLİNDİ
     )
 
-    model.fit(train_pool, eval_set=valid_pool, use_best_model=True)
+    # .fit() çağrısından validasyon parametrelerini kaldır
+    model.fit(train_pool) # <-- eval_set ve use_best_model SİLİNDİ
+    
     os.makedirs("models", exist_ok=True)
     model.save_model("models/cb_rank.cbm")
     pd.Series(feat_cols).to_csv("models/cb_rank_features.txt", index=False, header=False)
@@ -962,24 +948,43 @@ def run_baseline_timeaware(out_path: str):
         make_submission(scored_te[["session_id","content_id_hashed","pred_final"]],
                         out_path, session_index=idx)
 
-def run_train_ltr(alpha: float):
+# BU FONKSİYONU GÜNCELLE
+def run_train_ltr(alpha: float): # alpha artık kullanılmıyor ama uyumluluk için kalsın
     set_seed(42)
     with timer("LTR train"):
         train = load_train_sessions()
         feats = assemble_timeaware_features(train, windows=(7,30,60))
         feat_cols = _feature_cols(feats)
-        tr, va = split_time_holdout(feats, holdout_days=7)
-        m_click, m_order = train_ltr_models(tr, va, feat_cols)
+        
+        print("[TRAIN] Using FULL training data for LTR...")
+        tr = feats # <-- TÜM VERİYİ KULLAN
+        
+        # Click modeli için Dataset
+        dtr_click = lgb.Dataset(tr[feat_cols], label=tr["clicked"].astype(int), group=_group_counts(tr))
+        params_click = {
+            "objective": "lambdarank", "metric": "ndcg", "eval_at": [5, 10, 20, 100],
+            "boosting": "gbdt", "learning_rate": 0.06, "num_leaves": 63, "max_depth": -1,
+            "min_data_in_leaf": 40, "feature_fraction": 0.9, "bagging_fraction": 0.8,
+            "bagging_freq": 1, "verbose": -1,
+        }
+        # Not: num_boost_round'u validasyon sonuçlarına göre ayarlamak en iyisidir.
+        # Önceki log'larda click modeli ~600-800 arası duruyordu, o yüzden sabit bir değer veriyoruz.
+        print("Training click model on full data...")
+        m_click = lgb.train(params_click, dtr_click, num_boost_round=800)
 
-        # hızlı alpha taraması (log amaçlı)
-        for a in [0.70,0.74,0.78,0.80,0.82,0.85]:
-            tmp = va.copy()
-            tmp["pred_click"] = predict_rank_lgb(tmp, m_click)
-            tmp["pred_order"] = predict_rank_lgb(tmp, m_order)
-            tmp["pred_final"] = (1-a)*tmp["pred_click"] + a*tmp["pred_order"]
-            tmp = normalize_in_session(tmp, "pred_final")
-            proxy = tmp.groupby("session_id")["pred_final"].mean().mean()
-            print(f"[ALPHA] a={a:.2f} (valid mean score proxy={proxy:.6f})")
+        # Order modeli için Dataset
+        dtr_order = lgb.Dataset(tr[feat_cols], label=tr["ordered"].astype(int), group=_group_counts(tr))
+        params_order = {
+            "objective": "lambdarank", "metric": "ndcg", "eval_at": [5, 10, 20, 100],
+            "boosting": "gbdt", "learning_rate": 0.06, "num_leaves": 63, "max_depth": -1,
+            "min_data_in_leaf": 40, "feature_fraction": 0.9, "bagging_fraction": 0.8,
+            "bagging_freq": 1, "verbose": -1,
+        }
+        # Not: Order modeli genelde daha erken duruyordu (~200-400 iterasyon).
+        print("Training order model on full data...")
+        m_order = lgb.train(params_order, dtr_order, num_boost_round=400)
+
+        # Validasyon seti olmadığı için alpha taraması yapılamaz.
 
         save_lgb(m_click, os.path.join(MODELS_DIR,"lgb_click.txt"))
         save_lgb(m_order, os.path.join(MODELS_DIR,"lgb_order.txt"))
