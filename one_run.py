@@ -611,15 +611,34 @@ def _feature_cols(df: pd.DataFrame) -> list:
         if pd.api.types.is_numeric_dtype(df[c]): cols.append(c)
     return cols
 
-def split_time_holdout(df: pd.DataFrame, holdout_days=7, fallback_q=0.8):
-    ts = pd.to_datetime(df["ts_hour"])
-    cutoff = ts.max().normalize() - pd.Timedelta(days=holdout_days-1)
-    tr = df[ts < cutoff].copy(); va = df[ts >= cutoff].copy()
-    if len(tr)==0 or len(va)==0:
-        q = ts.quantile(fallback_q); tr=df[ts<q].copy(); va=df[ts>=q].copy()
-        print(f"[SPLIT] Fallback quantile used at {q}")
-    else:
-        print(f"[SPLIT] cutoff={cutoff.date()}  train={len(tr):,} rows  valid={len(va):,} rows")
+# ESKİ split_time_holdout FONKSİYONUNU SİLİP BUNU YAPIŞTIRIN
+def split_time_holdout(df: pd.DataFrame, holdout_pct=0.2):
+    """
+    Oturumların başlangıç zamanına göre ayıran daha güvenilir bir ayırma fonksiyonu.
+    """
+    print(f"[SPLIT] Using robust session-based time holdout (last {holdout_pct*100:.0f}%)...")
+    
+    # Her oturumun ilk etkileşim zamanını bul ve sırala
+    session_start_times = df.groupby("session_id")["ts_hour"].min().sort_values()
+    
+    # Ayırım noktasını belirle
+    num_sessions = len(session_start_times)
+    split_idx = int(num_sessions * (1 - holdout_pct))
+    
+    # Eğitim ve validasyon oturum ID'lerini ayır
+    train_session_ids = set(session_start_times.index[:split_idx])
+    valid_session_ids = set(session_start_times.index[split_idx:])
+    
+    # Veriyi bu ID'lere göre böl
+    tr = df[df["session_id"].isin(train_session_ids)].copy()
+    va = df[df["session_id"].isin(valid_session_ids)].copy()
+    
+    print(f"[SPLIT] Done. train={len(tr):,} rows ({len(train_session_ids):,} sessions) | "
+          f"valid={len(va):,} rows ({len(valid_session_ids):,} sessions)")
+    
+    if len(tr) == 0 or len(va) == 0:
+        raise ValueError("Train or validation split is empty! Check data integrity.")
+        
     return tr, va
 
 
