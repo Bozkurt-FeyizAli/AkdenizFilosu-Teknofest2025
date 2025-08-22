@@ -16,6 +16,7 @@ import os, time, argparse, numpy as np, pandas as pd
 import gc
 import duckdb
 import lightgbm as lgb
+import pyarrow.parquet as pq 
 
 # XGBoost & CatBoost opsiyonel — sistemde yoksa import hatası vermesin
 try:
@@ -1137,32 +1138,30 @@ def run_train_ltr(alpha: float):
         
         # --- Parçalı İşleme Bölümü ---
         
-        chunk_size = 5_000_000  # Her seferinde işlenecek satır sayısı. RAM'e göre artırıp azaltabilirsiniz.
+        chunk_size = 5_000_000
         source_file = os.path.join(DATA_DIR, 'train_sessions.parquet')
         temp_dir = "/kaggle/working/temp_chunks/"
         os.makedirs(temp_dir, exist_ok=True)
         
         print(f"Başlatılıyor: '{source_file}' dosyası {chunk_size:,} satırlık parçalar halinde işlenecek.")
 
-        # Parquet dosyasını parça parça okumak için bir 'iterator' kullanıyoruz.
-        parquet_iterator = pd.read_parquet(source_file, chunk_size=chunk_size, iterator=True)
+        # DÜZELTME: Parquet dosyasını pyarrow ile açıp, batch'ler halinde okuyoruz.
+        parquet_file = pq.ParquetFile(source_file)
+        batch_iterator = parquet_file.iter_batches(batch_size=chunk_size)
         
-        processed_chunk_paths = [] # İşlenmiş parçaların dosya yollarını tutacak liste
+        processed_chunk_paths = []
 
-        for i, chunk in enumerate(parquet_iterator):
-            print(f"--- Parça {i+1} işleniyor... ---")
+        for i, batch in enumerate(batch_iterator):
+            chunk = batch.to_pandas() # Her batch'i pandas DataFrame'e çeviriyoruz.
+            print(f"--- Parça {i+1} işleniyor... ({len(chunk):,} satır) ---")
             
-            # Her parça için zaman-bağımlı özellikleri hesapla
             processed_chunk = assemble_timeaware_features(chunk, windows=(7, 30, 60))
             
-            # İşlenmiş parçayı geçici bir dosyaya kaydet
             temp_path = os.path.join(temp_dir, f'processed_chunk_{i}.parquet')
             processed_chunk.to_parquet(temp_path)
             processed_chunk_paths.append(temp_path)
             
-            # RAM'i boşaltmak için gereksiz nesneleri sil ve çöp toplayıcıyı çağır
-            del chunk
-            del processed_chunk
+            del chunk, processed_chunk, batch
             gc.collect()
             print(f"Parça {i+1} tamamlandı ve '{temp_path}' olarak kaydedildi.")
         
@@ -1170,7 +1169,6 @@ def run_train_ltr(alpha: float):
 
         print("\nTüm parçalar işlendi. Şimdi birleştiriliyor...")
         
-        # İşlenmiş tüm parçaları birleştirerek nihai özellik setini (feats) oluştur
         feats = pd.concat(
             [pd.read_parquet(path) for path in processed_chunk_paths], 
             ignore_index=True
@@ -1178,23 +1176,24 @@ def run_train_ltr(alpha: float):
         
         print(f"Birleştirme tamamlandı. Toplam {len(feats):,} satırlık özellik seti oluşturuldu.")
         
-        # Belleği temizle
         del processed_chunk_paths
         gc.collect()
 
         # --- Orijinal Model Eğitimi Bölümü ---
         
+        print("Tüm veri üzerinden oturum-içi (in-session) özellikler hesaplanıyor...")
+        feats = add_in_session_features(feats)
+        
         feat_cols = _feature_cols(feats)
         tr, va = split_time_holdout(feats, holdout_days=7)
         
-        # Bellek optimizasyonu için artık ihtiyaç duyulmayan büyük 'feats' DataFrame'ini silebiliriz
         del feats
         gc.collect()
 
         print("\nModel eğitimi başlıyor...")
         m_click, m_order = train_ltr_models(tr, va, feat_cols)
 
-        # Hızlı alpha taraması (log amaçlı)
+        # Hızlı alpha taraması
         for a in [0.70, 0.74, 0.78, 0.80, 0.82, 0.85]:
             tmp = va.copy()
             tmp["pred_click"] = predict_rank_lgb(tmp, m_click)
