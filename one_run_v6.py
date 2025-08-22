@@ -575,20 +575,36 @@ def add_in_session_features(df: pd.DataFrame) -> pd.DataFrame:
                 .rank(method="first", ascending=False, pct=True)  # 1 = en yüksek indirim
     print("[FEAT] Adding new relative in-session features...")
     # --- YENİ EKLENEN ÖZELLİKLER ---
-    # Zaman özellikleri
     df["hour_of_day"] = df["ts_hour"].dt.hour.astype("int8")
     df["day_of_week"] = df["ts_hour"].dt.dayofweek.astype("int8")
+    # Saat ve günün döngüsel olduğunu belirtmek için sin/cos transformasyonu
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour_of_day']/24.0).astype("float32")
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour_of_day']/24.0).astype("float32")
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week']/7.0).astype("float32")
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week']/7.0).astype("float32")
+
 
     # Oturum içi fiyat ve indirim karşılaştırmaları
     if "selling_price" in df.columns:
+        # Oturumdaki ortalama fiyata göre ne kadar pahalı/ucuz
         sess_mean_price = df.groupby("session_id")["selling_price"].transform("mean")
         df["price_vs_session_mean"] = (df["selling_price"] / (sess_mean_price + 1e-6)).astype("float32")
 
+        # Oturumdaki en ucuz ürün mü?
+        df["is_cheapest_in_session"] = (df["selling_price"] == df.groupby("session_id")["selling_price"].transform("min")).astype("int8")
+
     if "discount_pct" in df.columns:
+        # Oturumdaki en yüksek indirimli ürün mü?
         df["is_highest_discount"] = (df["discount_pct"] == df.groupby("session_id")["discount_pct"].transform("max")).astype("int8")
 
     if "rating_avg" in df.columns:
+        # Oturumdaki en yüksek puanlı ürün mü?
         df["is_highest_rating"] = (df["rating_avg"] == df.groupby("session_id")["rating_avg"].transform("max")).astype("int8")
+
+    # Arama terimi uzunluğu (genel vs. spesifik arama sinyali)
+    if "search_term_normalized" in df.columns:
+        df["term_length"] = df["search_term_normalized"].str.len().astype("float32")
+
     # --- YENİ ÖZELLİKLERİN SONU ---
     return df
 
@@ -668,43 +684,46 @@ def train_ltr_models(tr: pd.DataFrame, va: pd.DataFrame, feat_cols: list):
     # click
     dtr = lgb.Dataset(tr[feat_cols], label=tr["clicked"].astype(int), group=_group_counts(tr))
     dva = lgb.Dataset(va[feat_cols], label=va["clicked"].astype(int), group=_group_counts(va))
+    # train_ltr_models fonksiyonu içinde
+
+    # CLICK MODELİ İÇİN
     params_click = {
         "objective": "lambdarank",
         "metric": "ndcg",
         "eval_at": [5, 10, 20, 100],
         "boosting": "gbdt",
-        "learning_rate": 0.02,     # <-- DEĞİŞTİ
-        "num_leaves": 95,          # <-- DEĞİŞTİ
-        "max_depth": -1,
-        "min_data_in_leaf": 60,    # <-- DEĞİŞTİ
-        "feature_fraction": 0.8,   # <-- DEĞİŞTİ
-        "bagging_fraction": 0.8,
+        "learning_rate": 0.015,       # <-- Daha yavaş öğrenme
+        "num_leaves": 64,             # <-- Overfitting'i azaltmak için düşürüldü
+        "max_depth": 7,               # <-- Sınırlama eklendi
+        "min_data_in_leaf": 100,      # <-- Regularizasyon için artırıldı
+        "feature_fraction": 0.7,      # <-- Biraz daha az özellik
+        "bagging_fraction": 0.7,
         "bagging_freq": 1,
         "verbose": -1,
         "seed": 42,
     }
-    m_click = lgb.train(params_click, dtr, num_boost_round=10000, # <-- DEĞİŞTİ
+    m_click = lgb.train(params_click, dtr, num_boost_round=15000, # <-- Artırıldı
                         valid_sets=[dtr, dva], valid_names=["train", "valid"],
                         callbacks=_callbacks())
-    # order
     dtr = lgb.Dataset(tr[feat_cols], label=tr["ordered"].astype(int), group=_group_counts(tr))
     dva = lgb.Dataset(va[feat_cols], label=va["ordered"].astype(int), group=_group_counts(va))
+    # ORDER MODELİ İÇİN (daha karmaşık olabilir)
     params_order = {
         "objective": "lambdarank",
         "metric": "ndcg",
         "eval_at": [5, 10, 20, 100],
         "boosting": "gbdt",
-        "learning_rate": 0.02,      # <-- DEĞİŞTİ
-        "num_leaves": 95,           # <-- DEĞİŞTİ
-        "max_depth": -1,
-        "min_data_in_leaf": 60,     # <-- DEĞİŞTİ
-        "feature_fraction": 0.8,    # <-- DEĞİŞTİ
+        "learning_rate": 0.015,       # <-- Daha yavaş öğrenme
+        "num_leaves": 128,            # <-- Güçlü olduğu için daha karmaşık olabilir
+        "max_depth": 8,               # <-- Sınırlama eklendi
+        "min_data_in_leaf": 80,       # <-- Artırıldı
+        "feature_fraction": 0.8,
         "bagging_fraction": 0.8,
         "bagging_freq": 1,
         "verbose": -1,
         "seed": 42,
     }
-    m_order = lgb.train(params_order, dtr, num_boost_round=10000, # <-- DEĞİŞTİ
+    m_order = lgb.train(params_order, dtr, num_boost_round=15000, # <-- Artırıldı
                         valid_sets=[dtr, dva], valid_names=["train", "valid"],
                         callbacks=_callbacks())
     return m_click, m_order
@@ -751,10 +770,10 @@ def ensure_feature_columns(df: pd.DataFrame, feat_cols: list) -> pd.DataFrame:
 def build_relevance(df: pd.DataFrame) -> pd.Series:
     o = df.get("ordered", 0).fillna(0).astype(int)
     c = df.get("clicked", 0).fillna(0).astype(int)
-    a = df.get("added_to_cart", 0).fillna(0).astype(int)
-    f = df.get("added_to_fav", 0).fillna(0).astype(int)
-    # Tümü pozitif TAM SAYI: order > cart > fav > click
-    rel = (4*o + 3*a + 2*f + 1*c).astype("int32")
+    # Sadece order ve click kullan, order'a ÇOK daha fazla önem ver
+    # Önceki: 4*o + 3*a + 2*f + 1*c
+    # Yeni:
+    rel = (10 * o + 1 * c).astype("int32") 
     return pd.Series(rel, index=df.index)
 
 
